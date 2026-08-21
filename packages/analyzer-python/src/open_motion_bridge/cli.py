@@ -103,6 +103,18 @@ def build_parser() -> argparse.ArgumentParser:
     sketch_image.add_argument("--hold-ms", type=float, default=2000.0)
     sketch_image.add_argument("--photo-fade-ms", type=float, default=1500.0)
     sketch_image.add_argument("--max-strokes", type=int, default=900)
+    sketch_image.add_argument(
+        "--color-mode",
+        choices=("none", "paint"),
+        default="none",
+        help="'paint' adds a human-like coloring pass (brush stamps sampled from the photo) after line drawing.",
+    )
+    sketch_image.add_argument(
+        "--closeup-zoom",
+        type=float,
+        default=0.0,
+        help="Follow the pen with a close-up camera at this zoom (e.g. 1.8). 0 disables.",
+    )
     sketch_image.add_argument("--force", action="store_true")
     return parser
 
@@ -188,8 +200,13 @@ def main(argv: list[str] | None = None) -> int:
             hold_ms=args.hold_ms,
             photo_fade_ms=args.photo_fade_ms,
             max_strokes=args.max_strokes,
+            color_mode=args.color_mode,
+            closeup_zoom=args.closeup_zoom,
             force=args.force,
         )
-        print(f"strokes={plan['vectorization']['strokeCount']} inkPx={plan['vectorization']['totalInkPx']}")
+        print(
+            f"strokes={plan['vectorization']['strokeCount']} inkPx={plan['vectorization']['totalInkPx']} "
+            f"stamps={plan['coloring']['stampCount']} camera={plan['camera']['mode']}"
+        )
         return 0
     raise AssertionError(f"Unhandled command: {args.command}")
