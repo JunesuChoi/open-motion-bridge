@@ -91,6 +91,19 @@ def build_parser() -> argparse.ArgumentParser:
     generate_photo.add_argument("--motion-spec", type=_path, required=True)
     generate_photo.add_argument("--output", type=_path, required=True)
     generate_photo.add_argument("--force", action="store_true")
+
+    sketch_image = subcommands.add_parser(
+        "sketch-image",
+        help="Vectorize a photo into ordered strokes and generate a self-drawing sketch project.",
+    )
+    sketch_image.add_argument("image", type=_path)
+    sketch_image.add_argument("--output", type=_path, required=True)
+    sketch_image.add_argument("--duration-ms", type=float, default=10000.0)
+    sketch_image.add_argument("--fps", type=float, default=30.0)
+    sketch_image.add_argument("--hold-ms", type=float, default=2000.0)
+    sketch_image.add_argument("--photo-fade-ms", type=float, default=1500.0)
+    sketch_image.add_argument("--max-strokes", type=int, default=900)
+    sketch_image.add_argument("--force", action="store_true")
     return parser
 
 
@@ -163,5 +176,20 @@ def main(argv: list[str] | None = None) -> int:
         generate_photo_project(
             args.ir, args.source_image, args.motion_spec, args.output, force=args.force
         )
+        return 0
+    if args.command == "sketch-image":
+        from .sketchdraw import generate_sketch_project
+
+        plan = generate_sketch_project(
+            args.image,
+            args.output,
+            duration_ms=args.duration_ms,
+            fps=args.fps,
+            hold_ms=args.hold_ms,
+            photo_fade_ms=args.photo_fade_ms,
+            max_strokes=args.max_strokes,
+            force=args.force,
+        )
+        print(f"strokes={plan['vectorization']['strokeCount']} inkPx={plan['vectorization']['totalInkPx']}")
         return 0
     raise AssertionError(f"Unhandled command: {args.command}")
