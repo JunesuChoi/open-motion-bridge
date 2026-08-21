@@ -49,6 +49,14 @@ Anything else is `needs-review`. An explicit human override may proceed, but mus
 | camera estimate failure | retain screen-space data; disable stabilized actions | use source-following effects or review manually |
 | unavailable model/license | do not fall back invisibly | report missing provider and choose an available approved provider |
 
+## Temporal-resolution policy
+
+- Keep the provider output in `tracking.ir.json` unchanged.
+- Apply smoothing only in a derived render IR, recording its profile, cutoff values, requested render FPS, visibility threshold, and gap policy.
+- Interpolate only across a configured short gap with available endpoint observations.
+- Hide a landmark after the allowed gap and mark it for manual correction instead of extrapolating a confident position.
+- Validate both raw continuity and the render IR's interpolation/hidden-gap counts before automatic approval.
+
 ## Render checks
 
 For each generated target:

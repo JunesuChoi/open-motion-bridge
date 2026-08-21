@@ -125,6 +125,26 @@ The resolver computes, but does not overwrite, source observations with quality 
 }
 ```
 
+## Render Tracking IR
+
+`tracking.ir.json` is immutable raw provider evidence. Generation creates a sibling `render.tracking.ir.json`; it is a derived, renderer-facing artifact and never overwrites the raw observations.
+
+```json
+{
+  "tracks": [{ "id": "person-001-render", "type": "pose" }],
+  "temporalProcessing": {
+    "algorithm": "one-euro-filter + confidence-aware linear interpolation",
+    "profile": "balanced",
+    "renderFps": 30,
+    "visibilityThreshold": 0.2,
+    "maxGapMs": 250,
+    "rawIrMutable": false
+  }
+}
+```
+
+Short per-landmark confidence losses may hold the last filtered position and are explicitly marked as interpolated. Long gaps are emitted with zero visibility and `manualCorrectionRequired: true`; the resolver must not invent confident coordinates.
+
 ## Schema evolution
 
 - Additive compatible fields increment the minor version.

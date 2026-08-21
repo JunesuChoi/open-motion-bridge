@@ -22,6 +22,7 @@ The first executable vertical slice is included:
 
 - local ffprobe/OpenCV ingest;
 - MediaPipe full-body pose sampling into immutable Tracking IR;
+- native-FPS analysis, One Euro temporal smoothing, confidence-aware gap handling, and render-FPS interpolation into a separate render Tracking IR;
 - deterministic HyperFrames source generation with a source-video pose overlay;
 - exact SVG skeleton trace export.
 
@@ -50,7 +51,8 @@ The generator supports `source`, `youtube-16x9`, `youtube-shorts-9x16`, `instagr
 ```powershell
 python -m open_motion_bridge analyze <local-video-path> --output <analysis-dir>
 python -m open_motion_bridge generate <analysis-dir>/tracking.ir.json `
-  --source-video <local-video-path> --output <hyperframes-project-dir> --target both --force
+  --source-video <local-video-path> --output <hyperframes-project-dir> --target both `
+  --render-fps 30 --smoothing-profile balanced --force
 ```
 
 Install the Python package first:
@@ -62,6 +64,8 @@ pip install -e .\packages\analyzer-python
 The generator stages a copy of the supplied source into the output project so the rendered project is self-contained. Keep generated projects outside a public repository unless you have redistribution rights to that source media.
 
 If decoded frame PTS extends past the container's declared A/V streams, the Tracking IR preserves the complete timing evidence while the generated composition uses the shortest declared A/V duration. This prevents a silent or frozen tail in the rendered deliverable.
+
+`analyze` samples every decodable source frame by default (`--sample-fps 0`). `generate` never alters that raw IR: it writes `render.tracking.ir.json` with configurable One Euro smoothing, short-gap holds, long-gap hiding, and interpolation at the requested render FPS. Use `responsive`, `balanced` (default), or `stable` according to the needed motion response.
 
 For a natural-language request, a Codex/Claude integration will first write and validate an `EditSpec`, show the resolved request to the user where required, then call the future deterministic patch/resolution commands. The core CLI has no hidden LLM dependency and does not treat arbitrary text as executable instruction.
 

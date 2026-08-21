@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from bisect import bisect_right
+from dataclasses import dataclass
 import hashlib
 import html
 import json
@@ -16,8 +18,63 @@ SCHEMA_VERSION = "0.1.0"
 POSE_CONNECTIONS = tuple((int(a), int(b)) for a, b in mp.solutions.pose.POSE_CONNECTIONS)
 
 
+@dataclass(frozen=True)
+class TemporalSmoothingConfig:
+    """Deterministic, renderer-facing temporal processing settings."""
+
+    profile: str
+    render_fps: float
+    min_cutoff: float
+    beta: float
+    derivative_cutoff: float
+    visibility_threshold: float
+    max_gap_ms: float
+
+
+_SMOOTHING_PROFILES: dict[str, tuple[float, float]] = {
+    "responsive": (1.4, 0.08),
+    "balanced": (1.0, 0.035),
+    "stable": (0.7, 0.015),
+}
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _temporal_smoothing_config(
+    profile: str,
+    render_fps: float,
+    visibility_threshold: float,
+    max_gap_ms: float,
+) -> TemporalSmoothingConfig:
+    if profile not in _SMOOTHING_PROFILES:
+        raise ValueError(f"Unknown smoothing profile: {profile}")
+    if render_fps <= 0:
+        raise ValueError("--render-fps must be greater than zero")
+    if not 0 <= visibility_threshold <= 1:
+        raise ValueError("--visibility-threshold must be between 0 and 1")
+    if max_gap_ms <= 0:
+        raise ValueError("--max-gap-ms must be greater than zero")
+    min_cutoff, beta = _SMOOTHING_PROFILES[profile]
+    return TemporalSmoothingConfig(
+        profile=profile,
+        render_fps=render_fps,
+        min_cutoff=min_cutoff,
+        beta=beta,
+        derivative_cutoff=1.0,
+        visibility_threshold=visibility_threshold,
+        max_gap_ms=max_gap_ms,
+    )
+
+
+def _sample_step(source_fps: float, requested_fps: float) -> int:
+    """Return a deterministic decode step; zero requests every source frame."""
+    if requested_fps < 0:
+        raise ValueError("--sample-fps must be zero (native) or greater")
+    if requested_fps == 0:
+        return 1
+    return max(1, round(source_fps / requested_fps))
 
 
 def _sha256(path: Path) -> str:
@@ -127,8 +184,8 @@ def _bbox(landmarks: list[dict[str, Any]]) -> dict[str, float]:
 def analyze_video(video: Path, output_dir: Path, sample_fps: float, force: bool) -> None:
     if not video.is_file():
         raise FileNotFoundError(f"Video not found: {video}")
-    if sample_fps <= 0:
-        raise ValueError("--sample-fps must be greater than zero")
+    if sample_fps < 0:
+        raise ValueError("--sample-fps must be zero (native) or greater")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     probe = _run_ffprobe(video)
@@ -136,11 +193,11 @@ def analyze_video(video: Path, output_dir: Path, sample_fps: float, force: bool)
     capture = cv2.VideoCapture(str(video))
     if not capture.isOpened():
         raise RuntimeError(f"OpenCV could not decode: {video}")
-    source_fps = capture.get(cv2.CAP_PROP_FPS) or sample_fps
+    source_fps = capture.get(cv2.CAP_PROP_FPS) or (sample_fps if sample_fps > 0 else 30.0)
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    step = max(1, round(source_fps / sample_fps))
+    step = _sample_step(source_fps, sample_fps)
 
     frames: list[dict[str, Any]] = []
     observations: list[dict[str, Any]] = []
@@ -238,7 +295,12 @@ def analyze_video(video: Path, output_dir: Path, sample_fps: float, force: bool)
                 "renderDurationSource": render_duration_source,
             },
         },
-        "sampling": {"requestedFps": sample_fps, "sourceFrameStep": step, "sampledFrames": len(frames)},
+        "sampling": {
+            "requestedFps": "source-native" if sample_fps == 0 else sample_fps,
+            "effectiveFps": round(source_fps / step, 6),
+            "sourceFrameStep": step,
+            "sampledFrames": len(frames),
+        },
     }
     continuity = detection_count / len(frames) if frames else 0.0
     ir = {
@@ -270,6 +332,7 @@ def analyze_video(video: Path, output_dir: Path, sample_fps: float, force: bool)
             }
         ],
         "cameraMotion": [],
+        "sampling": manifest["sampling"],
         "analysis": {
             "status": "completed" if observations else "completed-with-no-pose-detections",
             "sampledFrames": len(frames),
@@ -369,15 +432,27 @@ def _render_html(ir: dict[str, Any], pose_frames: list[dict[str, Any]], profile:
       const poseConnections = {connections_json};
       const poseCanvas = document.getElementById('pose-canvas');
       const poseContext = poseCanvas.getContext('2d');
-      const drawPose = (time) => {{
-        poseContext.clearRect(0, 0, poseCanvas.width, poseCanvas.height);
+      const interpolatePose = (time) => {{
         let low = 0;
         let high = poseFrames.length - 1;
         while (low < high) {{
           const middle = Math.ceil((low + high) / 2);
           if (poseFrames[middle].time <= time) low = middle; else high = middle - 1;
         }}
-        const frame = poseFrames[low];
+        const left = poseFrames[low];
+        const right = poseFrames[Math.min(low + 1, poseFrames.length - 1)];
+        if (!left || !right || left === right || right.time <= left.time) return left;
+        const ratio = Math.max(0, Math.min(1, (time - left.time) / (right.time - left.time)));
+        return {{
+          points: left.points.map((point, index) => {{
+            const next = right.points[index] || point;
+            return point.map((value, axis) => value + (next[axis] - value) * ratio);
+          }}),
+        }};
+      }};
+      const drawPose = (time) => {{
+        poseContext.clearRect(0, 0, poseCanvas.width, poseCanvas.height);
+        const frame = interpolatePose(time);
         if (!frame) return;
         poseContext.lineCap = 'round';
         poseContext.lineJoin = 'round';
@@ -431,7 +506,211 @@ def _render_svg(ir: dict[str, Any], skeletons: list[tuple[float, float, str]]) -
 '''
 
 
-def generate_projects(ir_path: Path, source_video: Path, output_dir: Path, target: str, profile: str, force: bool) -> None:
+def _low_pass(value: float, previous: float, cutoff: float, delta_seconds: float) -> float:
+    rate = 2.0 * 3.141592653589793 * cutoff * delta_seconds
+    alpha = rate / (rate + 1.0)
+    return alpha * value + (1.0 - alpha) * previous
+
+
+def _smooth_pose_observations(
+    observations: list[dict[str, Any]], config: TemporalSmoothingConfig
+) -> list[dict[str, Any]]:
+    """Apply One Euro filtering without ever mutating the immutable source IR."""
+    states: dict[str, dict[str, Any]] = {}
+    output: list[dict[str, Any]] = []
+    for observation in observations:
+        timestamp_ms = float(observation["sourceTimeMs"])
+        input_points = observation["screenSpace"]["keypoints"]
+        filtered_points: list[dict[str, Any]] = []
+        held_for_occlusion = False
+        for point in input_points:
+            point_name = str(point["name"])
+            state = states.setdefault(
+                point_name,
+                {"last_time_ms": None, "last_raw": {}, "last_filtered": {}, "last_derivative": {}, "last_good_ms": None},
+            )
+            visibility = float(point["visibility"])
+            valid = visibility >= config.visibility_threshold
+            filtered_point = {"name": point_name}
+            if valid:
+                previous_time = state["last_time_ms"]
+                delta_seconds = max(1.0 / 240.0, (timestamp_ms - previous_time) / 1000.0) if previous_time is not None else 0.0
+                for axis in ("x", "y", "z"):
+                    raw_value = float(point[axis])
+                    if previous_time is None:
+                        filtered_value = raw_value
+                        derivative = 0.0
+                    else:
+                        raw_derivative = (raw_value - state["last_raw"][axis]) / delta_seconds
+                        derivative = _low_pass(
+                            raw_derivative,
+                            state["last_derivative"][axis],
+                            config.derivative_cutoff,
+                            delta_seconds,
+                        )
+                        cutoff = config.min_cutoff + config.beta * abs(derivative)
+                        filtered_value = _low_pass(raw_value, state["last_filtered"][axis], cutoff, delta_seconds)
+                    state["last_raw"][axis] = raw_value
+                    state["last_filtered"][axis] = filtered_value
+                    state["last_derivative"][axis] = derivative
+                    filtered_point[axis] = round(filtered_value, 6)
+                state["last_time_ms"] = timestamp_ms
+                state["last_good_ms"] = timestamp_ms
+                filtered_point["visibility"] = round(visibility, 6)
+            else:
+                gap_ms = timestamp_ms - state["last_good_ms"] if state["last_good_ms"] is not None else float("inf")
+                if state["last_filtered"] and gap_ms <= config.max_gap_ms:
+                    for axis in ("x", "y", "z"):
+                        filtered_point[axis] = round(float(state["last_filtered"][axis]), 6)
+                    # The render IR marks this as an inferred short gap; raw visibility remains untouched in the source IR.
+                    filtered_point["visibility"] = round(config.visibility_threshold, 6)
+                    held_for_occlusion = True
+                else:
+                    for axis in ("x", "y", "z"):
+                        filtered_point[axis] = round(float(point[axis]), 6)
+                    filtered_point["visibility"] = 0.0
+            filtered_points.append(filtered_point)
+
+        confidence = sum(point["visibility"] for point in filtered_points) / len(filtered_points)
+        output.append(
+            {
+                "frameIndex": observation.get("frameIndex"),
+                "sourceTimeMs": round(timestamp_ms, 3),
+                "confidence": round(confidence, 6),
+                "occlusion": "interpolated-short-gap" if held_for_occlusion else observation.get("occlusion", "none"),
+                "screenSpace": {"bbox": _bbox(filtered_points), "keypoints": filtered_points},
+                "quality": {
+                    "interpolated": held_for_occlusion,
+                    "temporalSmoothingApplied": True,
+                    "manualCorrectionRequired": bool(observation.get("quality", {}).get("manualCorrectionRequired", False)),
+                },
+            }
+        )
+    return output
+
+
+def _interpolate_render_observations(
+    observations: list[dict[str, Any]], duration_ms: float, config: TemporalSmoothingConfig
+) -> list[dict[str, Any]]:
+    """Resample filtered observations to the renderer FPS, hiding long uncertain gaps."""
+    if not observations:
+        return []
+    source_times = [float(observation["sourceTimeMs"]) for observation in observations]
+    render_frame_count = max(1, int((duration_ms / 1000.0) * config.render_fps + 0.999999))
+    rendered: list[dict[str, Any]] = []
+    for render_frame_index in range(render_frame_count):
+        timestamp_ms = render_frame_index * 1000.0 / config.render_fps
+        right_index = bisect_right(source_times, timestamp_ms)
+        left_index = right_index - 1
+        if left_index < 0:
+            left_index = 0
+        if right_index >= len(observations):
+            right_index = left_index
+        left = observations[left_index]
+        right = observations[right_index]
+        left_time = source_times[left_index]
+        right_time = source_times[right_index]
+        gap_ms = right_time - left_time
+        ratio = 0.0 if gap_ms <= 0 else (timestamp_ms - left_time) / gap_ms
+        can_interpolate = left_index != right_index and 0 < gap_ms <= config.max_gap_ms
+        outside_short_hold = not can_interpolate and abs(timestamp_ms - left_time) > config.max_gap_ms
+        points: list[dict[str, Any]] = []
+        right_points = {str(point["name"]): point for point in right["screenSpace"]["keypoints"]}
+        for left_point in left["screenSpace"]["keypoints"]:
+            point_name = str(left_point["name"])
+            right_point = right_points.get(point_name, left_point)
+            point = {"name": point_name}
+            if can_interpolate:
+                for axis in ("x", "y", "z", "visibility"):
+                    point[axis] = round(float(left_point[axis]) + (float(right_point[axis]) - float(left_point[axis])) * ratio, 6)
+            else:
+                for axis in ("x", "y", "z", "visibility"):
+                    point[axis] = round(float(left_point[axis]), 6)
+            if outside_short_hold:
+                point["visibility"] = 0.0
+            points.append(point)
+        confidence = sum(point["visibility"] for point in points) / len(points)
+        rendered.append(
+            {
+                "frameIndex": left.get("frameIndex"),
+                "renderFrameIndex": render_frame_index,
+                "sourceTimeMs": round(timestamp_ms, 3),
+                "confidence": round(confidence, 6),
+                "occlusion": "long-gap-hidden" if outside_short_hold else left.get("occlusion", "none"),
+                "screenSpace": {"bbox": _bbox(points), "keypoints": points},
+                "quality": {
+                    "interpolated": can_interpolate,
+                    "temporalSmoothingApplied": True,
+                    "manualCorrectionRequired": outside_short_hold or bool(left.get("quality", {}).get("manualCorrectionRequired", False)),
+                },
+            }
+        )
+    return rendered
+
+
+def _build_render_tracking_ir(ir: dict[str, Any], config: TemporalSmoothingConfig) -> dict[str, Any]:
+    source_track = next((track for track in ir.get("tracks", []) if track.get("type") == "pose"), None)
+    if not source_track:
+        raise RuntimeError("No pose track is available for render-time temporal processing.")
+    filtered = _smooth_pose_observations(source_track.get("observations", []), config)
+    duration_ms = float(ir["source"].get("renderDurationMs", ir["source"]["durationMs"]))
+    rendered = _interpolate_render_observations(filtered, duration_ms, config)
+    if not rendered:
+        raise RuntimeError("No pose observations were produced; refusing to generate an unverified overlay project.")
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "source": ir["source"],
+        "coordinateSystem": ir["coordinateSystem"],
+        "tracks": [
+            {
+                "id": f'{source_track["id"]}-render',
+                "type": "pose",
+                "provider": {
+                    "name": "open-motion-bridge-temporal-resolver",
+                    "modelIdentifier": f"one-euro/{config.profile}",
+                    "sourceTrackId": source_track["id"],
+                    "sourceProvider": source_track.get("provider", {}).get("name", "unknown"),
+                },
+                "lifecycle": source_track.get("lifecycle", {}),
+                "observations": rendered,
+            }
+        ],
+        "temporalProcessing": {
+            "profile": config.profile,
+            "renderFps": config.render_fps,
+            "algorithm": "one-euro-filter + confidence-aware linear interpolation",
+            "minCutoff": config.min_cutoff,
+            "beta": config.beta,
+            "derivativeCutoff": config.derivative_cutoff,
+            "visibilityThreshold": config.visibility_threshold,
+            "maxGapMs": config.max_gap_ms,
+            "rawIrMutable": False,
+        },
+        "provenance": [
+            *ir.get("provenance", []),
+            {
+                "kind": "temporal-resolution",
+                "createdAt": _utc_now(),
+                "tool": "open-motion-bridge",
+                "toolVersion": SCHEMA_VERSION,
+                "sourceTrackId": source_track["id"],
+            },
+        ],
+    }
+
+
+def generate_projects(
+    ir_path: Path,
+    source_video: Path,
+    output_dir: Path,
+    target: str,
+    profile: str,
+    force: bool,
+    render_fps: float = 30.0,
+    smoothing_profile: str = "balanced",
+    visibility_threshold: float = 0.2,
+    max_gap_ms: float = 250.0,
+) -> None:
     if not ir_path.is_file():
         raise FileNotFoundError(f"Tracking IR not found: {ir_path}")
     if not source_video.is_file():
@@ -440,8 +719,15 @@ def generate_projects(ir_path: Path, source_video: Path, output_dir: Path, targe
     if ir.get("schemaVersion") != SCHEMA_VERSION:
         raise ValueError(f"Unsupported IR schema: {ir.get('schemaVersion')}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    observations = ir.get("tracks", [{}])[0].get("observations", [])
-    total_duration = float(ir["source"]["durationMs"]) / 1000.0
+    temporal_config = _temporal_smoothing_config(
+        profile=smoothing_profile,
+        render_fps=render_fps,
+        visibility_threshold=visibility_threshold,
+        max_gap_ms=max_gap_ms,
+    )
+    render_ir = _build_render_tracking_ir(ir, temporal_config)
+    observations = render_ir["tracks"][0]["observations"]
+    total_duration = float(ir["source"].get("renderDurationMs", ir["source"]["durationMs"])) / 1000.0
     skeletons: list[tuple[float, float, str]] = []
     for index, observation in enumerate(observations):
         start = round(float(observation["sourceTimeMs"]) / 1000.0, 3)
@@ -450,6 +736,7 @@ def generate_projects(ir_path: Path, source_video: Path, output_dir: Path, targe
         skeletons.append((start, max(0.001, next_start - start), _skeleton_markup(observation, int(ir["source"]["displayWidth"]), int(ir["source"]["displayHeight"]))))
     if not skeletons:
         raise RuntimeError("No pose observations were produced; refusing to generate an unverified overlay project.")
+    _write_json(output_dir / "render.tracking.ir.json", render_ir, force)
     if target in {"hyperframes", "both"}:
         html_path = output_dir / "index.html"
         if html_path.exists() and not force:
@@ -485,9 +772,10 @@ def generate_projects(ir_path: Path, source_video: Path, output_dir: Path, targe
                 "sourceHash": ir["source"]["sourceHash"],
                 "profile": profile,
                 "target": "hyperframes",
-                "trackId": "person-001",
+                "trackId": render_ir["tracks"][0]["id"],
                 "observationCount": len(skeletons),
                 "compositionDurationMs": round(float(ir["source"].get("renderDurationMs", ir["source"]["durationMs"])), 3),
+                "temporalProcessing": render_ir["temporalProcessing"],
             },
             force,
         )
