@@ -7,6 +7,7 @@ import html
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +24,17 @@ SCHEMA_VERSION = "0.1.0"
 # "skeleton" keeps the diagnostic tracking view, "bindings" shows only approved attached
 # assets, and "both" is the review view that proves assets sit on the tracked landmarks.
 OVERLAY_MODES = ("skeleton", "bindings", "both")
+
+# On Windows, console child processes (ffmpeg/ffprobe) otherwise flash a visible
+# terminal window per invocation; verify extracts many frames, so dozens of windows
+# would steal foreground focus. All subprocess calls must go through _run_quiet.
+_SUBPROCESS_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
+def _run_quiet(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+    """Run a console tool without spawning a visible window or stealing focus."""
+    kwargs.setdefault("creationflags", _SUBPROCESS_NO_WINDOW)
+    return subprocess.run(command, **kwargs)
 
 # Render verification thresholds. A binding sample is only measurable at full opacity,
 # and a template match below the minimum score is reported as unreliable instead of
@@ -299,7 +311,7 @@ def _sha256(path: Path) -> str:
 
 
 def _run_ffprobe(video: Path) -> dict[str, Any]:
-    completed = subprocess.run(
+    completed = _run_quiet(
         [
             "ffprobe",
             "-v",
@@ -345,7 +357,7 @@ def _reliable_playback_duration_ms(probe: dict[str, Any], fallback_ms: float) ->
 
 def _frame_timestamps(video: Path) -> list[float]:
     """Read presentation timestamps from ffprobe instead of trusting OpenCV clock state."""
-    completed = subprocess.run(
+    completed = _run_quiet(
         [
             "ffprobe",
             "-v",
@@ -1306,7 +1318,7 @@ def _rendered_video_dimensions(video: Path) -> tuple[int, int]:
 
 def _extract_frame(video: Path, timestamp_seconds: float, destination: Path) -> None:
     """Decode one frame at a presentation time so measurements use real rendered pixels."""
-    subprocess.run(
+    _run_quiet(
         [
             "ffmpeg",
             "-hide_banner",
