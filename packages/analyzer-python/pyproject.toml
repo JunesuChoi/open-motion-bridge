@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-motion-bridge"
+version = "0.1.0"
+description = "Local video-to-code pose analysis and HyperFrames trace generation"
+requires-python = ">=3.10"
+dependencies = [
+  "mediapipe>=0.10.0",
+  "opencv-python>=4.8.0"
+]
+
+[project.scripts]
+omb = "open_motion_bridge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
