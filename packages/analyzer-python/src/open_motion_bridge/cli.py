@@ -74,6 +74,23 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--samples", type=int, default=8)
     verify.add_argument("--tolerance-px", type=float, default=24.0)
     verify.add_argument("--force", action="store_true")
+
+    analyze_image = subcommands.add_parser(
+        "analyze-image", help="Create a single-observation Tracking IR from a still photo."
+    )
+    analyze_image.add_argument("image", type=_path)
+    analyze_image.add_argument("--output", type=_path, required=True)
+    analyze_image.add_argument("--force", action="store_true")
+
+    generate_photo = subcommands.add_parser(
+        "generate-photo",
+        help="Generate a HyperFrames motion-graphics project from a photo IR and a MotionSpec.",
+    )
+    generate_photo.add_argument("ir", type=_path)
+    generate_photo.add_argument("--source-image", type=_path, required=True)
+    generate_photo.add_argument("--motion-spec", type=_path, required=True)
+    generate_photo.add_argument("--output", type=_path, required=True)
+    generate_photo.add_argument("--force", action="store_true")
     return parser
 
 
@@ -135,4 +152,16 @@ def main(argv: list[str] | None = None) -> int:
             force=args.force,
         )
         return 0 if report["summary"]["passed"] else 1
+    if args.command == "analyze-image":
+        from .photomotion import analyze_image as run_analyze_image
+
+        run_analyze_image(args.image, args.output, force=args.force)
+        return 0
+    if args.command == "generate-photo":
+        from .photomotion import generate_photo_project
+
+        generate_photo_project(
+            args.ir, args.source_image, args.motion_spec, args.output, force=args.force
+        )
+        return 0
     raise AssertionError(f"Unhandled command: {args.command}")
