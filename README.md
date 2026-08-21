@@ -24,6 +24,8 @@ The first executable vertical slice is included:
 - MediaPipe full-body pose sampling and an opt-in MMPose RTMPose-L WholeBody provider into immutable Tracking IR;
 - native-FPS analysis, One Euro temporal smoothing, confidence-aware gap handling, and render-FPS interpolation into a separate render Tracking IR;
 - deterministic HyperFrames source generation with a source-video pose overlay;
+- declarative asset binding (EditSpec): attach text or image assets to named landmarks with confidence-aware fade/hide/hold, bbox-relative scaling, landmark-pair rotation, and per-frame speed clamping, resolved into an auditable `bindings.resolved.json`;
+- render reprojection verification (`verify`): re-measures where staged image assets actually landed in a rendered video against their resolved coordinates using masked template matching, and writes a pass/fail report;
 - exact SVG skeleton trace export.
 
 It is intentionally narrow. Automatic object tracking, camera stabilization, browser patch review, generic EditSpec resolution, Remotion export, and social-platform reframing remain roadmap items. The implemented commands are labelled below; unsupported commands must fail explicitly rather than imply that they worked.

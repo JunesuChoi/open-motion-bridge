@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .pipeline import MMPoseOptions, analyze_video, generate_projects
+from .pipeline import MMPoseOptions, analyze_video, generate_projects, verify_render
 
 
 def _path(value: str) -> Path:
@@ -51,7 +51,29 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--smoothing-profile", choices=("responsive", "balanced", "stable"), default="balanced")
     generate.add_argument("--visibility-threshold", type=float, default=0.2)
     generate.add_argument("--max-gap-ms", type=float, default=250.0)
+    generate.add_argument(
+        "--edit-spec",
+        type=_path,
+        help="Declarative asset binding spec. Never mutates the analysis IR.",
+    )
+    generate.add_argument(
+        "--overlay",
+        choices=("skeleton", "bindings", "both"),
+        default="skeleton",
+        help="What the composition draws: tracking skeleton, approved bindings, or both for review.",
+    )
     generate.add_argument("--force", action="store_true")
+
+    verify = subcommands.add_parser(
+        "verify",
+        help="Measure where bindings actually landed in a rendered file against their resolved coordinates.",
+    )
+    verify.add_argument("project", type=_path, help="Generated HyperFrames project directory.")
+    verify.add_argument("--rendered-video", type=_path, required=True)
+    verify.add_argument("--output", type=_path, required=True)
+    verify.add_argument("--samples", type=int, default=8)
+    verify.add_argument("--tolerance-px", type=float, default=24.0)
+    verify.add_argument("--force", action="store_true")
     return parser
 
 
@@ -99,6 +121,18 @@ def main(argv: list[str] | None = None) -> int:
             smoothing_profile=args.smoothing_profile,
             visibility_threshold=args.visibility_threshold,
             max_gap_ms=args.max_gap_ms,
+            edit_spec=args.edit_spec,
+            overlay=args.overlay,
         )
         return 0
+    if args.command == "verify":
+        report = verify_render(
+            args.project,
+            args.rendered_video,
+            args.output,
+            samples=args.samples,
+            tolerance_px=args.tolerance_px,
+            force=args.force,
+        )
+        return 0 if report["summary"]["passed"] else 1
     raise AssertionError(f"Unhandled command: {args.command}")

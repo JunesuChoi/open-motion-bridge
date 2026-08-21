@@ -7,6 +7,7 @@ import html
 import json
 import shutil
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,21 @@ from typing import Any
 import cv2
 import mediapipe as mp
 
+from .bindings import Binding, load_edit_spec, resolve_bindings
+
 SCHEMA_VERSION = "0.1.0"
+
+# Overlay modes decide what the generated composition draws on top of the source frame.
+# "skeleton" keeps the diagnostic tracking view, "bindings" shows only approved attached
+# assets, and "both" is the review view that proves assets sit on the tracked landmarks.
+OVERLAY_MODES = ("skeleton", "bindings", "both")
+
+# Render verification thresholds. A binding sample is only measurable at full opacity,
+# and a template match below the minimum score is reported as unreliable instead of
+# being converted into a false pass/fail distance.
+_VERIFY_MIN_OPACITY = 0.999
+_VERIFY_MIN_MATCH_SCORE = 0.55
+
 POSE_CONNECTIONS = tuple((int(a), int(b)) for a, b in mp.solutions.pose.POSE_CONNECTIONS)
 POSE_CONNECTION_NAMES = tuple(
     (
@@ -664,14 +679,130 @@ def _skeleton_markup(observation: dict[str, Any], width: int, height: int) -> st
     return "".join(lines + dots)
 
 
-def _render_html(ir: dict[str, Any], pose_frames: list[dict[str, Any]], profile: str) -> str:
+def _binding_elements_markup(bindings_payload: dict[str, Any] | None) -> str:
+    """Emit one inspectable DOM node per binding so generated source maps back to a binding id."""
+    if not bindings_payload:
+        return ""
+    elements: list[str] = []
+    for binding in bindings_payload["bindings"]:
+        identifier = html.escape(str(binding["id"]))
+        style = binding.get("style", {})
+        if binding["kind"] == "text":
+            declarations = ";".join(
+                (
+                    f'color:{html.escape(str(style.get("color", "#fff2d9")))}',
+                    f'font-weight:{html.escape(str(style.get("fontWeight", "800")))}',
+                    f'font-family:{html.escape(str(style.get("fontFamily", "Arial, sans-serif")))}',
+                    f'letter-spacing:{html.escape(str(style.get("letterSpacing", "0.04em")))}',
+                    f'-webkit-text-stroke:{html.escape(str(style.get("strokeWidth", "6px")))}'
+                    f' {html.escape(str(style.get("strokeColor", "rgba(23,19,15,0.88)")))}',
+                )
+            )
+            elements.append(
+                f'<div class="omb-binding omb-binding-text" data-binding-id="{identifier}" '
+                f'style="{declarations}">{html.escape(str(binding["text"]))}</div>'
+            )
+        else:
+            elements.append(
+                f'<img class="omb-binding omb-binding-image" data-binding-id="{identifier}" '
+                f'src="{html.escape(str(binding["source"]))}" alt="" />'
+            )
+    return "".join(elements)
+
+
+def _binding_render_payload(bindings_payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Reduce the resolved binding table to the fields a composition actually reads."""
+    if not bindings_payload:
+        return []
+    return [
+        {
+            "id": binding["id"],
+            "kind": binding["kind"],
+            "aspect": binding["aspect"],
+            "frames": [
+                {
+                    "t": frame["t"],
+                    "x": frame["x"],
+                    "y": frame["y"],
+                    "size": frame["size"],
+                    "rotation": frame["rotation"],
+                    "opacity": frame["opacity"],
+                }
+                for frame in binding["frames"]
+            ],
+        }
+        for binding in bindings_payload["bindings"]
+    ]
+
+
+def _stage_binding_assets(
+    bindings_payload: dict[str, Any], edit_spec: Path | None, assets_dir: Path
+) -> None:
+    """Copy referenced image assets next to the composition and rewrite their source paths.
+
+    Image sources are resolved relative to the EditSpec file so a spec stays portable.
+    The true pixel aspect ratio replaces any declared value, because a wrong aspect
+    silently distorts every attached asset and cannot be caught by coordinate checks.
+    """
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    base_dir = edit_spec.parent if edit_spec is not None else Path.cwd()
+    for binding in bindings_payload["bindings"]:
+        if binding["kind"] != "image":
+            continue
+        raw_source = str(binding["source"])
+        candidate = Path(raw_source)
+        resolved = candidate if candidate.is_absolute() else (base_dir / candidate)
+        resolved = resolved.expanduser()
+        if not resolved.is_file():
+            raise FileNotFoundError(
+                f"Binding {binding['id']!r} references a missing image asset: {resolved}"
+            )
+        staged_name = f"binding-{binding['id']}{resolved.suffix.lower()}"
+        shutil.copy2(resolved, assets_dir / staged_name)
+        image = cv2.imread(str(resolved), cv2.IMREAD_UNCHANGED)
+        if image is None:
+            raise RuntimeError(f"Binding {binding['id']!r} image could not be decoded: {resolved}")
+        pixel_height, pixel_width = image.shape[0], image.shape[1]
+        if pixel_height <= 0:
+            raise RuntimeError(f"Binding {binding['id']!r} image has an invalid height: {resolved}")
+        binding["source"] = f"assets/{staged_name}"
+        binding["aspect"] = round(pixel_width / pixel_height, 6)
+        binding["assetEvidence"] = {
+            "originalPath": str(resolved),
+            "sha256": _sha256(resolved),
+            "pixelWidth": int(pixel_width),
+            "pixelHeight": int(pixel_height),
+        }
+
+
+def _render_html(
+    ir: dict[str, Any],
+    pose_frames: list[dict[str, Any]],
+    profile: str,
+    bindings_payload: dict[str, Any] | None = None,
+    overlay: str = "skeleton",
+) -> str:
+    if overlay not in OVERLAY_MODES:
+        raise ValueError(f"Unknown overlay mode: {overlay}")
     source = ir["source"]
-    width, height = int(source["displayWidth"]), int(source["displayHeight"])
+    source_width, source_height = int(source["displayWidth"]), int(source["displayHeight"])
+    width, height = source_width, source_height
     duration = max(0.1, float(source.get("renderDurationMs", source["durationMs"])) / 1000.0)
     source_track = next((track for track in ir.get("tracks", []) if track.get("type") == "pose"), {})
     provider_name = html.escape(str(source_track.get("provider", {}).get("name", "local-pose-provider")))
     if profile in {"youtube-shorts-9x16", "instagram-reel-9x16"}:
         width, height = 1080, 1920
+    show_skeleton = overlay in {"skeleton", "both"}
+    show_bindings = overlay in {"bindings", "both"}
+    hud_display = "" if show_skeleton else "display:none;"
+    skeleton_display = "" if show_skeleton else "display:none;"
+    binding_markup = _binding_elements_markup(bindings_payload) if show_bindings else ""
+    bindings_json = json.dumps(
+        _binding_render_payload(bindings_payload) if show_bindings else [],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    size_scale = round(width / source_width, 6)
     pose_json = json.dumps(pose_frames, ensure_ascii=False, separators=(",", ":"))
     connections_json = json.dumps(POSE_CONNECTION_NAMES, separators=(",", ":"))
     return f'''<!doctype html>
@@ -687,7 +818,11 @@ def _render_html(ir: dict[str, Any], pose_frames: list[dict[str, Any]], profile:
       #root {{ position: relative; width: {width}px; height: {height}px; overflow: hidden; font-family: Arial, sans-serif; }}
       .clip {{ position: absolute; inset: 0; }}
       #source-video {{ position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }}
-      #pose-canvas {{ position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }}
+      #pose-canvas {{ position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; {skeleton_display} }}
+      #binding-layer {{ position: absolute; inset: 0; pointer-events: none; }}
+      .omb-binding {{ position: absolute; left: 0; top: 0; opacity: 0; transform-origin: 50% 50%; will-change: transform, opacity; white-space: nowrap; }}
+      .omb-binding-text {{ line-height: 1; paint-order: stroke fill; }}
+      .omb-binding-image {{ object-fit: contain; }}
       #hud-backplate {{ position: absolute; top: 42px; left: 36px; width: 720px; height: 148px; background: rgba(23, 19, 15, 0.82); border-left: 6px solid #ffb45b; }}
       #hud-inner {{ position: absolute; top: 64px; left: 64px; color: #fff9ed; }}
       #hud-label {{ font-size: 24px; font-weight: 700; letter-spacing: 0.16em; }}
@@ -700,7 +835,8 @@ def _render_html(ir: dict[str, Any], pose_frames: list[dict[str, Any]], profile:
       <video id="source-video" src="assets/source.mp4" muted playsinline data-start="0" data-duration="{duration:.3f}" data-track-index="1"></video>
       <audio id="source-audio" src="assets/source.mp4" data-start="0" data-track-index="2" data-volume="1"></audio>
       <canvas id="pose-canvas" class="clip" data-start="0" data-duration="{duration:.3f}" data-track-index="3" width="{source["displayWidth"]}" height="{source["displayHeight"]}"></canvas>
-      <section id="hud" class="clip" data-start="0" data-duration="2.1" data-track-index="4">
+      <div id="binding-layer" class="clip" data-start="0" data-duration="{duration:.3f}" data-track-index="4">{binding_markup}</div>
+      <section id="hud" class="clip" data-start="0" data-duration="2.1" data-track-index="5" style="{skeleton_display}">
         <div id="hud-backplate"></div>
         <div id="hud-inner"><div id="hud-label">POSE TRACE</div><div id="hud-detail">local {provider_name} → Tracking IR → HyperFrames</div></div>
         <div id="corner"></div>
@@ -762,6 +898,64 @@ def _render_html(ir: dict[str, Any], pose_frames: list[dict[str, Any]], profile:
       const poseState = {{ time: 0 }};
       drawPose(0);
       tl.to(poseState, {{ time: {duration:.3f}, duration: {duration:.3f}, ease: 'none', onUpdate: () => drawPose(poseState.time) }}, 0);
+      const bindingTracks = {bindings_json};
+      const bindingSizeScale = {size_scale};
+      const bindingNodes = bindingTracks.map((track) => {{
+        const node = document.querySelector('[data-binding-id="' + track.id + '"]');
+        if (node && track.kind === 'text') node.style.fontSize = '100px';
+        return {{ track: track, node: node, measured: 0 }};
+      }});
+      const bindingFrameAt = (frames, time) => {{
+        let low = 0;
+        let high = frames.length - 1;
+        while (low < high) {{
+          const middle = Math.ceil((low + high) / 2);
+          if (frames[middle].t <= time) low = middle; else high = middle - 1;
+        }}
+        const left = frames[low];
+        const right = frames[Math.min(low + 1, frames.length - 1)];
+        if (!left || !right || left === right || right.t <= left.t) return left;
+        const ratio = Math.max(0, Math.min(1, (time - left.t) / (right.t - left.t)));
+        const mix = (a, b) => a + (b - a) * ratio;
+        return {{
+          t: time,
+          x: mix(left.x, right.x),
+          y: mix(left.y, right.y),
+          size: mix(left.size, right.size),
+          rotation: mix(left.rotation, right.rotation),
+          opacity: mix(left.opacity, right.opacity),
+        }};
+      }};
+      const drawBindings = (time) => {{
+        for (const entry of bindingNodes) {{
+          if (!entry.node) continue;
+          const frame = bindingFrameAt(entry.track.frames, time);
+          if (!frame) continue;
+          if (frame.opacity <= 0) {{ entry.node.style.opacity = '0'; continue; }}
+          const sizePx = frame.size * bindingSizeScale;
+          let width = sizePx;
+          let height = sizePx / (entry.track.aspect || 1);
+          if (entry.track.kind === 'text') {{
+            if (!entry.measured) entry.measured = entry.node.getBoundingClientRect().width / 100 || 1;
+            entry.node.style.fontSize = sizePx.toFixed(3) + 'px';
+            width = sizePx * entry.measured;
+            height = sizePx;
+          }} else {{
+            entry.node.style.width = width.toFixed(3) + 'px';
+            entry.node.style.height = height.toFixed(3) + 'px';
+          }}
+          const left = frame.x * {width} - width / 2;
+          const top = frame.y * {height} - height / 2;
+          entry.node.style.opacity = String(frame.opacity);
+          entry.node.style.transform =
+            'translate(' + left.toFixed(3) + 'px,' + top.toFixed(3) + 'px) rotate(' + frame.rotation.toFixed(3) + 'deg)';
+        }}
+      }};
+      const bindingState = {{ time: 0 }};
+      drawBindings(0);
+      if (bindingTracks.length) {{
+        tl.to(bindingState, {{ time: {duration:.3f}, duration: {duration:.3f}, ease: 'none', onUpdate: () => drawBindings(bindingState.time) }}, 0);
+      }}
       tl.fromTo('#hud-inner', {{ opacity: 0, y: -24 }}, {{ opacity: 1, y: 0, duration: 0.45, ease: 'power3.out' }}, 0.12);
       tl.to('#hud-inner', {{ opacity: 0, duration: 0.35, ease: 'power2.in' }}, 1.65);
       tl.set('#hud-inner', {{ opacity: 0 }}, 1.95);
@@ -991,11 +1185,17 @@ def generate_projects(
     smoothing_profile: str = "balanced",
     visibility_threshold: float = 0.2,
     max_gap_ms: float = 250.0,
+    edit_spec: Path | None = None,
+    overlay: str = "skeleton",
 ) -> None:
     if not ir_path.is_file():
         raise FileNotFoundError(f"Tracking IR not found: {ir_path}")
     if not source_video.is_file():
         raise FileNotFoundError(f"Source video not found: {source_video}")
+    if overlay not in OVERLAY_MODES:
+        raise ValueError(f"Unknown overlay mode: {overlay}; expected one of {list(OVERLAY_MODES)}")
+    if overlay in {"bindings", "both"} and edit_spec is None:
+        raise ValueError(f"Overlay mode {overlay!r} requires --edit-spec; refusing to render an empty asset layer.")
     ir = json.loads(ir_path.read_text(encoding="utf-8"))
     if ir.get("schemaVersion") != SCHEMA_VERSION:
         raise ValueError(f"Unsupported IR schema: {ir.get('schemaVersion')}")
@@ -1009,6 +1209,16 @@ def generate_projects(
     render_ir = _build_render_tracking_ir(ir, temporal_config)
     observations = render_ir["tracks"][0]["observations"]
     total_duration = float(ir["source"].get("renderDurationMs", ir["source"]["durationMs"])) / 1000.0
+    source_width = int(ir["source"]["displayWidth"])
+    source_height = int(ir["source"]["displayHeight"])
+
+    bindings_payload: dict[str, Any] | None = None
+    if edit_spec is not None:
+        bindings = load_edit_spec(edit_spec)
+        bindings_payload = resolve_bindings(bindings, render_ir, source_width, source_height)
+        bindings_payload["sourceEditSpec"] = edit_spec.name
+        bindings_payload["sourceHash"] = ir["source"]["sourceHash"]
+
     skeletons: list[tuple[float, float, str]] = []
     for index, observation in enumerate(observations):
         start = round(float(observation["sourceTimeMs"]) / 1000.0, 3)
@@ -1028,6 +1238,8 @@ def generate_projects(
         if staged_video.exists() and not force:
             raise FileExistsError(f"Refusing to overwrite {staged_video}; use --force for generated output.")
         shutil.copy2(source_video, staged_video)
+        if bindings_payload is not None:
+            _stage_binding_assets(bindings_payload, edit_spec, assets)
         if force:
             compositions_dir = output_dir / "compositions"
             if compositions_dir.exists():
@@ -1047,7 +1259,11 @@ def generate_projects(
             }
             for observation in observations
         ]
-        html_path.write_text(_render_html(ir, pose_frames, profile), encoding="utf-8")
+        html_path.write_text(
+            _render_html(ir, pose_frames, profile, bindings_payload, overlay), encoding="utf-8"
+        )
+        if bindings_payload is not None:
+            _write_json(output_dir / "bindings.resolved.json", bindings_payload, force)
         _write_json(
             output_dir / "open-motion-bridge.generated.json",
             {
@@ -1057,10 +1273,15 @@ def generate_projects(
                 "sourceHash": ir["source"]["sourceHash"],
                 "profile": profile,
                 "target": "hyperframes",
+                "overlay": overlay,
                 "trackId": render_ir["tracks"][0]["id"],
                 "observationCount": len(skeletons),
                 "compositionDurationMs": round(float(ir["source"].get("renderDurationMs", ir["source"]["durationMs"])), 3),
                 "temporalProcessing": render_ir["temporalProcessing"],
+                "bindings": [
+                    {"id": binding["id"], "kind": binding["kind"], "stats": binding["stats"]}
+                    for binding in (bindings_payload or {}).get("bindings", [])
+                ],
             },
             force,
         )
@@ -1069,3 +1290,301 @@ def generate_projects(
         if svg_path.exists() and not force:
             raise FileExistsError(f"Refusing to overwrite {svg_path}; use --force for generated output.")
         svg_path.write_text(_render_svg(ir, skeletons), encoding="utf-8")
+
+
+def _rendered_video_dimensions(video: Path) -> tuple[int, int]:
+    probe = _run_ffprobe(video)
+    for stream in probe.get("streams", []):
+        if stream.get("codec_type") != "video":
+            continue
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+        if width > 0 and height > 0:
+            return width, height
+    raise RuntimeError(f"ffprobe reported no usable video dimensions: {video}")
+
+
+def _extract_frame(video: Path, timestamp_seconds: float, destination: Path) -> None:
+    """Decode one frame at a presentation time so measurements use real rendered pixels."""
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            f"{timestamp_seconds:.6f}",
+            "-i",
+            str(video),
+            "-frames:v",
+            "1",
+            str(destination),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    if not destination.is_file():
+        raise RuntimeError(f"ffmpeg produced no frame at {timestamp_seconds:.3f}s from {video}")
+
+
+def _sample_binding_frames(binding: dict[str, Any], samples: int) -> list[dict[str, Any]]:
+    """Pick evenly spaced frames where the binding is fully opaque.
+
+    Faded frames are deliberately excluded: a partially transparent asset cannot be
+    localized reliably, so including it would weaken the measurement instead of the render.
+    """
+    visible = [frame for frame in binding["frames"] if float(frame["opacity"]) >= _VERIFY_MIN_OPACITY]
+    if not visible:
+        return []
+    if len(visible) <= samples:
+        return list(visible)
+    step = (len(visible) - 1) / (samples - 1) if samples > 1 else 0.0
+    picked: list[dict[str, Any]] = []
+    used: set[int] = set()
+    for index in range(samples):
+        position = int(round(index * step))
+        if position in used:
+            continue
+        used.add(position)
+        picked.append(visible[position])
+    return picked
+
+
+def _measure_binding_in_frame(
+    numpy_module: Any,
+    rendered_frame: Any,
+    project_dir: Path,
+    binding: dict[str, Any],
+    frame: dict[str, Any],
+    pixel_scale: float,
+    rendered_width: int,
+    rendered_height: int,
+    tolerance_px: float,
+) -> dict[str, Any]:
+    """Locate the staged asset near its resolved position and report the pixel error."""
+    expected_x = float(frame["x"]) * rendered_width
+    expected_y = float(frame["y"]) * rendered_height
+    result: dict[str, Any] = {
+        "t": round(float(frame["t"]), 6),
+        "expected": {"x": round(expected_x, 3), "y": round(expected_y, 3)},
+        "measured": None,
+        "errorPx": None,
+        "matchScore": None,
+        "status": "not-measured",
+    }
+
+    asset_path = project_dir / str(binding["source"])
+    if not asset_path.is_file():
+        result["status"] = "missing-staged-asset"
+        return result
+    asset = cv2.imread(str(asset_path), cv2.IMREAD_UNCHANGED)
+    if asset is None:
+        result["status"] = "undecodable-staged-asset"
+        return result
+
+    template_width = max(2, int(round(float(frame["size"]) * pixel_scale)))
+    aspect = float(binding.get("aspect") or 1.0)
+    template_height = max(2, int(round(template_width / aspect)))
+    resized = cv2.resize(asset, (template_width, template_height), interpolation=cv2.INTER_AREA)
+    mask = None
+    if resized.ndim == 2:
+        template = cv2.cvtColor(resized, cv2.COLOR_GRAY2BGR)
+    elif resized.shape[2] == 4:
+        template = numpy_module.ascontiguousarray(resized[:, :, :3])
+        alpha = numpy_module.ascontiguousarray(resized[:, :, 3])
+        mask = cv2.merge([alpha, alpha, alpha])
+    else:
+        template = numpy_module.ascontiguousarray(resized[:, :, :3])
+
+    # Search a bounded neighbourhood so a visually similar area elsewhere in the frame
+    # cannot masquerade as a correct placement.
+    margin = max(tolerance_px * 4.0, 48.0)
+    half_width = template_width / 2.0 + margin
+    half_height = template_height / 2.0 + margin
+    x0 = int(max(0, round(expected_x - half_width)))
+    y0 = int(max(0, round(expected_y - half_height)))
+    x1 = int(min(rendered_frame.shape[1], round(expected_x + half_width)))
+    y1 = int(min(rendered_frame.shape[0], round(expected_y + half_height)))
+    region = rendered_frame[y0:y1, x0:x1]
+    if region.shape[0] < template_height or region.shape[1] < template_width:
+        result["status"] = "expected-position-outside-measurable-area"
+        return result
+
+    scores = cv2.matchTemplate(region, template, cv2.TM_CCORR_NORMED, mask=mask)
+    scores = numpy_module.nan_to_num(scores, nan=-1.0, posinf=-1.0, neginf=-1.0)
+    _, max_score, _, max_location = cv2.minMaxLoc(scores)
+    measured_x = x0 + max_location[0] + template_width / 2.0
+    measured_y = y0 + max_location[1] + template_height / 2.0
+    error = ((measured_x - expected_x) ** 2 + (measured_y - expected_y) ** 2) ** 0.5
+
+    result["measured"] = {"x": round(measured_x, 3), "y": round(measured_y, 3)}
+    result["errorPx"] = round(error, 3)
+    result["matchScore"] = round(float(max_score), 6)
+    result["templateSize"] = {"width": template_width, "height": template_height}
+    result["searchRegion"] = {"x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0}
+    if float(max_score) < _VERIFY_MIN_MATCH_SCORE:
+        result["status"] = "unreliable-match"
+    elif error <= tolerance_px:
+        result["status"] = "measured"
+    else:
+        result["status"] = "measured-out-of-tolerance"
+    return result
+
+
+def verify_render(
+    project_dir: Path,
+    rendered_video: Path,
+    output_path: Path,
+    samples: int = 8,
+    tolerance_px: float = 24.0,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Re-measure rendered asset placement against the resolved binding table.
+
+    This is the only step that can claim a generated video matches its approved data,
+    because it reads the rendered pixels instead of trusting the generator.
+    """
+    import numpy
+
+    if not project_dir.is_dir():
+        raise FileNotFoundError(f"Generated project directory not found: {project_dir}")
+    if not rendered_video.is_file():
+        raise FileNotFoundError(f"Rendered video not found: {rendered_video}")
+    if samples < 1:
+        raise ValueError("--samples must be at least 1")
+    if tolerance_px <= 0:
+        raise ValueError("--tolerance-px must be greater than zero")
+
+    bindings_path = project_dir / "bindings.resolved.json"
+    if not bindings_path.is_file():
+        raise FileNotFoundError(
+            f"No resolved binding table in {project_dir}; run generate with --edit-spec before verify."
+        )
+    payload = json.loads(bindings_path.read_text(encoding="utf-8"))
+    if payload.get("schemaVersion") != SCHEMA_VERSION:
+        raise ValueError(f"Unsupported resolved binding schema: {payload.get('schemaVersion')!r}")
+
+    space = payload["coordinateSpace"]
+    source_width = int(space["pixelWidth"])
+    source_height = int(space["pixelHeight"])
+    rendered_width, rendered_height = _rendered_video_dimensions(rendered_video)
+    pixel_scale = rendered_width / source_width
+
+    generated_path = project_dir / "open-motion-bridge.generated.json"
+    generated = json.loads(generated_path.read_text(encoding="utf-8")) if generated_path.is_file() else {}
+
+    plan: dict[float, list[tuple[int, dict[str, Any]]]] = {}
+    reports: list[dict[str, Any]] = []
+    for index, binding in enumerate(payload["bindings"]):
+        entry: dict[str, Any] = {
+            "id": binding["id"],
+            "kind": binding["kind"],
+            "anchorLandmarks": binding.get("anchorLandmarks", []),
+            "status": "pending",
+            "samples": [],
+        }
+        if binding["kind"] != "image":
+            # Text glyph localization is not implemented; reporting it as unmeasured keeps
+            # the summary honest instead of implying a verified placement.
+            entry["status"] = "not-measurable-non-image-binding"
+        else:
+            picked = _sample_binding_frames(binding, samples)
+            if not picked:
+                entry["status"] = "not-measurable-never-fully-visible"
+            else:
+                for frame in picked:
+                    plan.setdefault(round(float(frame["t"]), 6), []).append((index, frame))
+        reports.append(entry)
+
+    with tempfile.TemporaryDirectory(prefix="omb-verify-") as temporary:
+        temporary_dir = Path(temporary)
+        for order, timestamp in enumerate(sorted(plan)):
+            frame_path = temporary_dir / f"frame-{order:04d}.png"
+            _extract_frame(rendered_video, timestamp, frame_path)
+            rendered_frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+            if rendered_frame is None:
+                raise RuntimeError(f"Extracted frame could not be decoded: {frame_path}")
+            for binding_index, frame in plan[timestamp]:
+                reports[binding_index]["samples"].append(
+                    _measure_binding_in_frame(
+                        numpy,
+                        rendered_frame,
+                        project_dir,
+                        payload["bindings"][binding_index],
+                        frame,
+                        pixel_scale,
+                        rendered_width,
+                        rendered_height,
+                        tolerance_px,
+                    )
+                )
+
+    warnings: list[str] = []
+    measurable_count = 0
+    passed_count = 0
+    overall_max_error = 0.0
+    for entry in reports:
+        if not entry["samples"]:
+            if entry["status"] == "pending":
+                entry["status"] = "not-measurable-no-samples"
+            warnings.append(f"binding {entry['id']!r}: {entry['status']}")
+            continue
+        measurable_count += 1
+        errors = [sample["errorPx"] for sample in entry["samples"] if sample["errorPx"] is not None]
+        failed = [sample for sample in entry["samples"] if sample["status"] != "measured"]
+        entry["measuredSamples"] = len(entry["samples"])
+        entry["maxErrorPx"] = round(max(errors), 3) if errors else None
+        entry["meanErrorPx"] = round(sum(errors) / len(errors), 3) if errors else None
+        entry["status"] = "passed" if not failed else "failed"
+        if entry["status"] == "passed":
+            passed_count += 1
+        else:
+            for sample in failed:
+                warnings.append(
+                    f"binding {entry['id']!r} at {sample['t']:.3f}s: {sample['status']}"
+                    + (f" ({sample['errorPx']}px)" if sample["errorPx"] is not None else "")
+                )
+        if errors:
+            overall_max_error = max(overall_max_error, max(errors))
+
+    if measurable_count == 0:
+        warnings.append("No binding could be measured; this report is not evidence of a correct render.")
+
+    report = {
+        "schemaVersion": SCHEMA_VERSION,
+        "createdAt": _utc_now(),
+        "tool": "open-motion-bridge",
+        "project": str(project_dir),
+        "renderedVideo": {
+            "path": str(rendered_video),
+            "sha256": _sha256(rendered_video),
+            "width": rendered_width,
+            "height": rendered_height,
+        },
+        "sourceSpace": {"width": source_width, "height": source_height, "pixelScale": round(pixel_scale, 6)},
+        "generated": {
+            "sourceHash": generated.get("sourceHash"),
+            "profile": generated.get("profile"),
+            "overlay": generated.get("overlay"),
+            "temporalProcessing": generated.get("temporalProcessing"),
+        },
+        "policy": {
+            "requestedSamples": samples,
+            "tolerancePx": tolerance_px,
+            "minMatchScore": _VERIFY_MIN_MATCH_SCORE,
+            "minOpacity": _VERIFY_MIN_OPACITY,
+            "method": "masked template matching (TM_CCORR_NORMED) inside a bounded neighbourhood",
+        },
+        "bindings": reports,
+        "summary": {
+            "measurableBindings": measurable_count,
+            "passedBindings": passed_count,
+            "maxErrorPx": round(overall_max_error, 3),
+            "passed": measurable_count > 0 and passed_count == measurable_count,
+            "warnings": warnings,
+        },
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(output_path, report, force)
+    return report
