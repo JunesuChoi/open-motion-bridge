@@ -49,6 +49,8 @@ Anything else is `needs-review`. An explicit human override may proceed, but mus
 | camera estimate failure | retain screen-space data; disable stabilized actions | use source-following effects or review manually |
 | unavailable model/license | do not fall back invisibly | report missing provider and choose an available approved provider |
 
+For the optional MMPose provider, require local pose and detector configs/checkpoints, 133 named WholeBody landmarks, and a recorded provider/version/device. A missing runtime, missing model asset, invalid model output, or uncertain primary-subject association is a visible failure or review signal; it must never silently become a MediaPipe analysis.
+
 ## Temporal-resolution policy
 
 - Keep the provider output in `tracking.ir.json` unchanged.

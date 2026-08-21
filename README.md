@@ -21,7 +21,7 @@ It is designed for AI agents to use through a general `SKILL.md`, while the actu
 The first executable vertical slice is included:
 
 - local ffprobe/OpenCV ingest;
-- MediaPipe full-body pose sampling into immutable Tracking IR;
+- MediaPipe full-body pose sampling and an opt-in MMPose RTMPose-L WholeBody provider into immutable Tracking IR;
 - native-FPS analysis, One Euro temporal smoothing, confidence-aware gap handling, and render-FPS interpolation into a separate render Tracking IR;
 - deterministic HyperFrames source generation with a source-video pose overlay;
 - exact SVG skeleton trace export.
@@ -55,11 +55,25 @@ python -m open_motion_bridge generate <analysis-dir>/tracking.ir.json `
   --render-fps 30 --smoothing-profile balanced --force
 ```
 
+For high-precision face and hand anchors, use the opt-in MMPose provider with **local** model assets. It never downloads a model or silently falls back to MediaPipe:
+
+```powershell
+python -m open_motion_bridge analyze <local-video-path> --output <analysis-dir> `
+  --pose-provider mmpose-rtmpose-l-wholebody `
+  --mmpose-pose-config <local-rtmpose-wholebody-config.py> `
+  --mmpose-pose-weights <local-rtmpose-wholebody-checkpoint.pth> `
+  --mmpose-detector-config <local-person-detector-config.py> `
+  --mmpose-detector-weights <local-person-detector-checkpoint.pth> `
+  --mmpose-device cuda:0
+```
+
 Install the Python package first:
 
 ```powershell
 pip install -e .\packages\analyzer-python
 ```
+
+MMPose needs a compatible PyTorch/MMCV/MMDetection environment and is deliberately optional. See [MMPose provider setup](docs/mmpose-provider.md) before installing it.
 
 The generator stages a copy of the supplied source into the output project so the rendered project is self-contained. Keep generated projects outside a public repository unless you have redistribution rights to that source media.
 
@@ -96,6 +110,7 @@ Before analyzing, distributing, or rendering footage, ensure that you have the r
 - [Tracking IR schema](docs/ir-schema.md)
 - [Natural-language EditSpec contract](docs/edit-spec.md)
 - [Validation and review policy](docs/validation.md)
+- [MMPose provider setup](docs/mmpose-provider.md)
 - [Risks and licensing](docs/risks-and-licenses.md)
 - [Implementation roadmap](ROADMAP.md)
 - [Agent entry point](SKILL.md)

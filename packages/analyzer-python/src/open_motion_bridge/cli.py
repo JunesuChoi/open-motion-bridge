@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .pipeline import analyze_video, generate_projects
+from .pipeline import MMPoseOptions, analyze_video, generate_projects
 
 
 def _path(value: str) -> Path:
@@ -26,6 +26,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="Analysis FPS; use 0 (default) to preserve every decodable source frame.",
     )
+    analyze.add_argument(
+        "--pose-provider",
+        choices=("mediapipe", "mmpose-rtmpose-l-wholebody"),
+        default="mediapipe",
+        help="Pose provider. MMPose requires explicit local config and checkpoint files.",
+    )
+    analyze.add_argument("--mmpose-pose-config", type=_path, help="Local RTMPose-L WholeBody config path.")
+    analyze.add_argument("--mmpose-pose-weights", type=_path, help="Local RTMPose-L WholeBody checkpoint path.")
+    analyze.add_argument("--mmpose-detector-config", type=_path, help="Local person-detector config path.")
+    analyze.add_argument("--mmpose-detector-weights", type=_path, help="Local person-detector checkpoint path.")
+    analyze.add_argument("--mmpose-device", default="cuda:0", help="MMPose device, for example cuda:0 or cpu.")
     analyze.add_argument("--force", action="store_true")
 
     generate = subcommands.add_parser(
@@ -47,7 +58,34 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "analyze":
-        analyze_video(args.video, args.output, sample_fps=args.sample_fps, force=args.force)
+        mmpose_options = None
+        if args.pose_provider == "mmpose-rtmpose-l-wholebody":
+            required_assets = {
+                "--mmpose-pose-config": args.mmpose_pose_config,
+                "--mmpose-pose-weights": args.mmpose_pose_weights,
+                "--mmpose-detector-config": args.mmpose_detector_config,
+                "--mmpose-detector-weights": args.mmpose_detector_weights,
+            }
+            missing_assets = [flag for flag, path in required_assets.items() if path is None]
+            if missing_assets:
+                raise ValueError(
+                    "MMPose provider requires explicit local assets: " + ", ".join(missing_assets)
+                )
+            mmpose_options = MMPoseOptions(
+                pose_config=args.mmpose_pose_config,
+                pose_weights=args.mmpose_pose_weights,
+                detector_config=args.mmpose_detector_config,
+                detector_weights=args.mmpose_detector_weights,
+                device=args.mmpose_device,
+            )
+        analyze_video(
+            args.video,
+            args.output,
+            sample_fps=args.sample_fps,
+            force=args.force,
+            pose_provider=args.pose_provider,
+            mmpose_options=mmpose_options,
+        )
         return 0
     if args.command == "generate":
         generate_projects(

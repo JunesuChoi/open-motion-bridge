@@ -12,6 +12,16 @@ dependencies = [
   "opencv-python>=4.8.0"
 ]
 
+[project.optional-dependencies]
+# Install a PyTorch build that matches the intended CPU/CUDA runtime first.
+# MMPose's optional MMDetection stack is deliberately not a base dependency.
+mmpose = [
+  "mmpose>=1.3,<2",
+  "mmdet>=3.0,<4",
+  "mmcv>=2.0,<3",
+  "mmengine>=0.10,<1"
+]
+
 [project.scripts]
 omb = "open_motion_bridge.cli:main"
 

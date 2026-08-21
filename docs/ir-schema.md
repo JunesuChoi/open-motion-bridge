@@ -93,6 +93,12 @@ Each sampled frame identifies both source time and decode order.
 
 `type` is one of `pose`, `object`, or `roi-object`. A pose track uses named landmarks; object tracks may omit `keypoints` and use a bbox, mask reference, contour, or path geometry according to the published minor schema.
 
+### MMPose WholeBody naming
+
+The optional `mmpose-rtmpose-l-wholebody` provider maps COCO-WholeBody's 133 predictions into stable names: 23 body/foot landmarks, `face_00` through `face_67`, `left_hand_00` through `left_hand_20`, and `right_hand_00` through `right_hand_20`. It does not publish provider array indices as a rendering contract. MMPose confidence is clamped to the IR's `[0,1]` `visibility` range and its 2D output has `z: 0`.
+
+The first MMPose slice exports one primary subject: it selects the highest-confidence/largest candidate initially, then uses bbox IoU across subsequent frames. Low-IoU matches are recorded in `lifecycle.idChanges` and require manual correction; full multi-person persistent-track export remains a future provider capability.
+
 ## Camera motion record
 
 ```json

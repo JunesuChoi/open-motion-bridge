@@ -16,6 +16,45 @@ import mediapipe as mp
 
 SCHEMA_VERSION = "0.1.0"
 POSE_CONNECTIONS = tuple((int(a), int(b)) for a, b in mp.solutions.pose.POSE_CONNECTIONS)
+POSE_CONNECTION_NAMES = tuple(
+    (
+        mp.solutions.pose.PoseLandmark(start).name.lower(),
+        mp.solutions.pose.PoseLandmark(end).name.lower(),
+    )
+    for start, end in POSE_CONNECTIONS
+)
+
+# COCO-WholeBody stores 23 body/foot, 68 face, and 21 keypoints per hand.
+# Names deliberately stay provider-neutral so render and patch consumers can anchor
+# graphics by landmark name instead of an opaque provider-specific array index.
+COCO_WHOLEBODY_KEYPOINT_NAMES = (
+    "nose",
+    "left_eye",
+    "right_eye",
+    "left_ear",
+    "right_ear",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_hip",
+    "right_hip",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle",
+    "left_big_toe",
+    "left_small_toe",
+    "left_heel",
+    "right_big_toe",
+    "right_small_toe",
+    "right_heel",
+    *(f"face_{index:02d}" for index in range(68)),
+    *(f"left_hand_{index:02d}" for index in range(21)),
+    *(f"right_hand_{index:02d}" for index in range(21)),
+)
 
 
 @dataclass(frozen=True)
@@ -29,6 +68,17 @@ class TemporalSmoothingConfig:
     derivative_cutoff: float
     visibility_threshold: float
     max_gap_ms: float
+
+
+@dataclass(frozen=True)
+class MMPoseOptions:
+    """Explicit local assets for the opt-in RTMPose-L WholeBody provider."""
+
+    pose_config: Path
+    pose_weights: Path
+    detector_config: Path
+    detector_weights: Path
+    device: str
 
 
 _SMOOTHING_PROFILES: dict[str, tuple[float, float]] = {
@@ -75,6 +125,154 @@ def _sample_step(source_fps: float, requested_fps: float) -> int:
     if requested_fps == 0:
         return 1
     return max(1, round(source_fps / requested_fps))
+
+
+def _bounded_score(value: Any) -> float:
+    """Convert provider confidence to the Tracking IR's normalized visibility range."""
+    return max(0.0, min(1.0, float(value)))
+
+
+def _as_python_sequence(value: Any) -> list[Any]:
+    """Normalize lists and NumPy-like values without adding NumPy as a hard dependency."""
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if not isinstance(value, (list, tuple)):
+        raise RuntimeError("MMPose returned a non-sequence keypoint payload.")
+    return list(value)
+
+
+def _unwrap_single_batch(value: Any) -> list[Any]:
+    """MMPose may return a singleton batch dimension for one input frame."""
+    result = _as_python_sequence(value)
+    if len(result) == 1 and isinstance(result[0], (list, tuple)):
+        return _as_python_sequence(result[0])
+    return result
+
+
+def _mmpose_landmarks(
+    raw_keypoints: Any,
+    raw_scores: Any,
+    width: int,
+    height: int,
+) -> list[dict[str, Any]]:
+    """Map an MMPose COCO-WholeBody prediction to canonical named screen-space points."""
+    keypoints = _unwrap_single_batch(raw_keypoints)
+    scores = _unwrap_single_batch(raw_scores)
+    expected_count = len(COCO_WHOLEBODY_KEYPOINT_NAMES)
+    if len(keypoints) != expected_count or len(scores) != expected_count:
+        raise RuntimeError(
+            "Expected exactly 133 COCO-WholeBody keypoints from the MMPose provider; "
+            f"received keypoints={len(keypoints)}, scores={len(scores)}."
+        )
+    landmarks: list[dict[str, Any]] = []
+    for name, coordinates, score in zip(COCO_WHOLEBODY_KEYPOINT_NAMES, keypoints, scores, strict=True):
+        xy = _as_python_sequence(coordinates)
+        if len(xy) < 2:
+            raise RuntimeError(f"MMPose keypoint {name!r} does not contain x/y coordinates.")
+        landmarks.append(
+            {
+                "name": name,
+                "x": round(float(xy[0]) / width, 6),
+                "y": round(float(xy[1]) / height, 6),
+                "z": 0.0,
+                "visibility": round(_bounded_score(score), 6),
+            }
+        )
+    return landmarks
+
+
+def _mmpose_candidates(result: dict[str, Any], width: int, height: int) -> list[dict[str, Any]]:
+    """Extract all frame candidates while keeping raw provider ordering out of the IR contract."""
+    predictions = result.get("predictions")
+    if not isinstance(predictions, list) or len(predictions) != 1:
+        raise RuntimeError("MMPose returned an unexpected prediction batch for one input frame.")
+    instances = predictions[0]
+    if not isinstance(instances, list):
+        raise RuntimeError("MMPose returned an invalid per-frame instance list.")
+    candidates: list[dict[str, Any]] = []
+    for provider_index, instance in enumerate(instances):
+        if not isinstance(instance, dict):
+            raise RuntimeError("MMPose returned a non-object instance prediction.")
+        landmarks = _mmpose_landmarks(
+            instance.get("keypoints"),
+            instance.get("keypoint_scores"),
+            width,
+            height,
+        )
+        confidence = sum(point["visibility"] for point in landmarks) / len(landmarks)
+        bbox = _bbox(landmarks)
+        candidates.append(
+            {
+                "providerIndex": provider_index,
+                "landmarks": landmarks,
+                "confidence": round(confidence, 6),
+                "bbox": bbox,
+            }
+        )
+    return candidates
+
+
+def _bbox_area(bbox: dict[str, float]) -> float:
+    return max(0.0, bbox["width"]) * max(0.0, bbox["height"])
+
+
+def _bbox_iou(first: dict[str, float], second: dict[str, float]) -> float:
+    first_right, first_bottom = first["x"] + first["width"], first["y"] + first["height"]
+    second_right, second_bottom = second["x"] + second["width"], second["y"] + second["height"]
+    intersection_width = max(0.0, min(first_right, second_right) - max(first["x"], second["x"]))
+    intersection_height = max(0.0, min(first_bottom, second_bottom) - max(first["y"], second["y"]))
+    intersection = intersection_width * intersection_height
+    union = _bbox_area(first) + _bbox_area(second) - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _select_mmpose_subject(
+    candidates: list[dict[str, Any]], previous_bbox: dict[str, float] | None
+) -> tuple[dict[str, Any], float | None]:
+    """Keep a primary subject stable using IoU after the initial confident/largest selection."""
+    if not candidates:
+        raise ValueError("Cannot select an MMPose subject from an empty candidate list.")
+    if previous_bbox is None:
+        return max(candidates, key=lambda candidate: (candidate["confidence"], _bbox_area(candidate["bbox"]))), None
+    selected = max(
+        candidates,
+        key=lambda candidate: (
+            _bbox_iou(previous_bbox, candidate["bbox"]),
+            candidate["confidence"],
+            _bbox_area(candidate["bbox"]),
+        ),
+    )
+    return selected, round(_bbox_iou(previous_bbox, selected["bbox"]), 6)
+
+
+def _create_mmpose_inferencer(options: MMPoseOptions) -> tuple[Any, str]:
+    """Create MMPose only when all local assets are explicitly supplied."""
+    for label, path in (
+        ("pose config", options.pose_config),
+        ("pose checkpoint", options.pose_weights),
+        ("detector config", options.detector_config),
+        ("detector checkpoint", options.detector_weights),
+    ):
+        if not path.is_file():
+            raise FileNotFoundError(f"MMPose {label} is not a local file: {path}")
+    try:
+        import mmpose
+        from mmpose.apis import MMPoseInferencer
+    except ImportError as error:
+        raise RuntimeError(
+            "MMPose provider requested but its runtime is unavailable. Install the optional "
+            "MMPose dependencies and a supported PyTorch build; Open Motion Bridge will not "
+            "silently fall back to MediaPipe."
+        ) from error
+    inferencer = MMPoseInferencer(
+        pose2d=str(options.pose_config),
+        pose2d_weights=str(options.pose_weights),
+        det_model=str(options.detector_config),
+        det_weights=str(options.detector_weights),
+        det_cat_ids=[0],
+        device=options.device,
+    )
+    return inferencer, str(getattr(mmpose, "__version__", "unknown"))
 
 
 def _sha256(path: Path) -> str:
@@ -181,11 +379,44 @@ def _bbox(landmarks: list[dict[str, Any]]) -> dict[str, float]:
     }
 
 
-def analyze_video(video: Path, output_dir: Path, sample_fps: float, force: bool) -> None:
+def _mediapipe_landmarks(result: Any) -> list[dict[str, Any]]:
+    if not result.pose_landmarks:
+        return []
+    return [
+        {
+            "name": mp.solutions.pose.PoseLandmark(number).name.lower(),
+            "x": round(float(item.x), 6),
+            "y": round(float(item.y), 6),
+            "z": round(float(item.z), 6),
+            "visibility": round(float(item.visibility), 6),
+        }
+        for number, item in enumerate(result.pose_landmarks.landmark)
+    ]
+
+
+def analyze_video(
+    video: Path,
+    output_dir: Path,
+    sample_fps: float,
+    force: bool,
+    pose_provider: str = "mediapipe",
+    mmpose_options: MMPoseOptions | None = None,
+) -> None:
     if not video.is_file():
         raise FileNotFoundError(f"Video not found: {video}")
     if sample_fps < 0:
         raise ValueError("--sample-fps must be zero (native) or greater")
+    if pose_provider not in {"mediapipe", "mmpose-rtmpose-l-wholebody"}:
+        raise ValueError(f"Unsupported pose provider: {pose_provider}")
+    if pose_provider == "mmpose-rtmpose-l-wholebody" and mmpose_options is None:
+        raise ValueError("MMPose provider requires explicit local model and detector assets.")
+    mmpose_inferencer: Any | None = None
+    mmpose_version: str | None = None
+    if pose_provider == "mmpose-rtmpose-l-wholebody":
+        if mmpose_options is None:
+            raise AssertionError("MMPose options were not validated.")
+        # Fail before ingest or artifact creation when optional local runtime/assets are unavailable.
+        mmpose_inferencer, mmpose_version = _create_mmpose_inferencer(mmpose_options)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     probe = _run_ffprobe(video)
@@ -202,13 +433,49 @@ def analyze_video(video: Path, output_dir: Path, sample_fps: float, force: bool)
     frames: list[dict[str, Any]] = []
     observations: list[dict[str, Any]] = []
     detection_count = 0
-    pose = mp.solutions.pose.Pose(
-        static_image_mode=False,
-        model_complexity=1,
-        enable_segmentation=False,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
+    pose: Any | None = None
+    previous_mmpose_bbox: dict[str, float] | None = None
+    mmpose_multi_candidate_frames = 0
+    mmpose_low_iou_frames: list[int] = []
+    if pose_provider == "mediapipe":
+        pose = mp.solutions.pose.Pose(
+            static_image_mode=False,
+            model_complexity=1,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        provider_metadata = {
+            "name": "mediapipe-pose",
+            "version": getattr(mp, "__version__", "unknown"),
+            "modelIdentifier": "Pose(model_complexity=1)",
+            "licenseHint": "Verify MediaPipe and model distribution terms before release.",
+        }
+        analysis_limitations = [
+            "Object tracking and camera stabilization are not implemented in this vertical slice.",
+            "stabilizedSpace is intentionally unavailable rather than fabricated.",
+        ]
+    else:
+        if mmpose_options is None or mmpose_version is None:
+            raise AssertionError("MMPose provider was not initialized.")
+        provider_metadata = {
+            "name": "mmpose-rtmpose-l-wholebody",
+            "version": mmpose_version,
+            "modelIdentifier": "RTMPose-L COCO-WholeBody (133 keypoints)",
+            "licenseHint": "MMPose runtime is Apache-2.0; verify local checkpoint and detector licenses before release.",
+            "assets": {
+                "poseConfig": mmpose_options.pose_config.name,
+                "poseCheckpoint": mmpose_options.pose_weights.name,
+                "detectorConfig": mmpose_options.detector_config.name,
+                "detectorCheckpoint": mmpose_options.detector_weights.name,
+                "device": mmpose_options.device,
+            },
+        }
+        analysis_limitations = [
+            "Object tracking and camera stabilization are not implemented in this vertical slice.",
+            "stabilizedSpace is intentionally unavailable rather than fabricated.",
+            "The MMPose provider emits one primary subject selected by bbox IoU after the initial confident/largest instance; full multi-person persistent track export is not implemented.",
+        ]
     try:
         index = 0
         while True:
@@ -230,20 +497,27 @@ def analyze_video(video: Path, output_dir: Path, sample_fps: float, force: bool)
                     "decodeStatus": "decoded",
                 }
             )
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            result = pose.process(rgb)
-            if result.pose_landmarks:
-                landmarks = [
-                    {
-                        "name": mp.solutions.pose.PoseLandmark(number).name.lower(),
-                        "x": round(float(item.x), 6),
-                        "y": round(float(item.y), 6),
-                        "z": round(float(item.z), 6),
-                        "visibility": round(float(item.visibility), 6),
-                    }
-                    for number, item in enumerate(result.pose_landmarks.landmark)
-                ]
+            selection_iou: float | None = None
+            if pose is not None:
+                landmarks = _mediapipe_landmarks(pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+            else:
+                if mmpose_inferencer is None:
+                    raise AssertionError("MMPose provider was not initialized.")
+                mmpose_result = next(mmpose_inferencer(frame, return_vis=False))
+                candidates = _mmpose_candidates(mmpose_result, width, height)
+                if len(candidates) > 1:
+                    mmpose_multi_candidate_frames += 1
+                if candidates:
+                    selected, selection_iou = _select_mmpose_subject(candidates, previous_mmpose_bbox)
+                    previous_mmpose_bbox = selected["bbox"]
+                    landmarks = selected["landmarks"]
+                else:
+                    landmarks = []
+            if landmarks:
                 mean_visibility = sum(item["visibility"] for item in landmarks) / len(landmarks)
+                uncertain_subject_match = selection_iou is not None and selection_iou < 0.05
+                if uncertain_subject_match:
+                    mmpose_low_iou_frames.append(index)
                 observations.append(
                     {
                         "frameIndex": index,
@@ -253,15 +527,16 @@ def analyze_video(video: Path, output_dir: Path, sample_fps: float, force: bool)
                         "screenSpace": {"bbox": _bbox(landmarks), "keypoints": landmarks},
                         "quality": {
                             "interpolated": False,
-                            "driftWarning": False,
-                            "manualCorrectionRequired": mean_visibility < 0.5,
+                            "driftWarning": uncertain_subject_match,
+                            "manualCorrectionRequired": mean_visibility < 0.5 or uncertain_subject_match,
                         },
                     }
                 )
                 detection_count += 1
             index += 1
     finally:
-        pose.close()
+        if pose is not None:
+            pose.close()
         capture.release()
 
     container_duration_ms = 0.0
@@ -316,17 +591,15 @@ def analyze_video(video: Path, output_dir: Path, sample_fps: float, force: bool)
             {
                 "id": "person-001",
                 "type": "pose",
-                "provider": {
-                    "name": "mediapipe-pose",
-                    "version": getattr(mp, "__version__", "unknown"),
-                    "modelIdentifier": "Pose(model_complexity=1)",
-                    "licenseHint": "Verify MediaPipe and model distribution terms before release.",
-                },
+                "provider": provider_metadata,
                 "lifecycle": {
                     "firstFrame": observations[0]["frameIndex"] if observations else None,
                     "lastFrame": observations[-1]["frameIndex"] if observations else None,
                     "reidentifiedFrom": [],
-                    "idChanges": [],
+                    "idChanges": [
+                        {"frameIndex": frame_index, "reason": "low-iou-primary-subject-match"}
+                        for frame_index in mmpose_low_iou_frames
+                    ],
                 },
                 "observations": observations,
             }
@@ -338,10 +611,16 @@ def analyze_video(video: Path, output_dir: Path, sample_fps: float, force: bool)
             "sampledFrames": len(frames),
             "poseDetections": detection_count,
             "continuity": round(continuity, 6),
-            "limitations": [
-                "Object tracking and camera stabilization are not implemented in this vertical slice.",
-                "stabilizedSpace is intentionally unavailable rather than fabricated.",
-            ],
+            "limitations": analysis_limitations,
+            "mmposeSubjectSelection": (
+                {
+                    "policy": "initial-confidence-area, then bbox-iou",
+                    "multipleCandidateFrames": mmpose_multi_candidate_frames,
+                    "lowIouMatchFrames": mmpose_low_iou_frames,
+                }
+                if pose_provider == "mmpose-rtmpose-l-wholebody"
+                else None
+            ),
         },
         "provenance": [
             {
@@ -363,10 +642,10 @@ def _coordinate(value: float, pixels: int) -> str:
 
 def _skeleton_markup(observation: dict[str, Any], width: int, height: int) -> str:
     points = observation["screenSpace"]["keypoints"]
-    by_index = {index: point for index, point in enumerate(points)}
+    by_name = {str(point["name"]): point for point in points}
     lines = []
-    for start, end in POSE_CONNECTIONS:
-        a, b = by_index.get(start), by_index.get(end)
+    for start, end in POSE_CONNECTION_NAMES:
+        a, b = by_name.get(start), by_name.get(end)
         if not a or not b or min(a["visibility"], b["visibility"]) < 0.2:
             continue
         lines.append(
@@ -389,10 +668,12 @@ def _render_html(ir: dict[str, Any], pose_frames: list[dict[str, Any]], profile:
     source = ir["source"]
     width, height = int(source["displayWidth"]), int(source["displayHeight"])
     duration = max(0.1, float(source.get("renderDurationMs", source["durationMs"])) / 1000.0)
+    source_track = next((track for track in ir.get("tracks", []) if track.get("type") == "pose"), {})
+    provider_name = html.escape(str(source_track.get("provider", {}).get("name", "local-pose-provider")))
     if profile in {"youtube-shorts-9x16", "instagram-reel-9x16"}:
         width, height = 1080, 1920
     pose_json = json.dumps(pose_frames, ensure_ascii=False, separators=(",", ":"))
-    connections_json = json.dumps(POSE_CONNECTIONS, separators=(",", ":"))
+    connections_json = json.dumps(POSE_CONNECTION_NAMES, separators=(",", ":"))
     return f'''<!doctype html>
 <html lang="en" data-resolution="portrait">
   <head>
@@ -421,7 +702,7 @@ def _render_html(ir: dict[str, Any], pose_frames: list[dict[str, Any]], profile:
       <canvas id="pose-canvas" class="clip" data-start="0" data-duration="{duration:.3f}" data-track-index="3" width="{source["displayWidth"]}" height="{source["displayHeight"]}"></canvas>
       <section id="hud" class="clip" data-start="0" data-duration="2.1" data-track-index="4">
         <div id="hud-backplate"></div>
-        <div id="hud-inner"><div id="hud-label">POSE TRACE</div><div id="hud-detail">local MediaPipe → Tracking IR → HyperFrames</div></div>
+        <div id="hud-inner"><div id="hud-label">POSE TRACE</div><div id="hud-detail">local {provider_name} → Tracking IR → HyperFrames</div></div>
         <div id="corner"></div>
       </section>
     </div>
@@ -444,10 +725,10 @@ def _render_html(ir: dict[str, Any], pose_frames: list[dict[str, Any]], profile:
         if (!left || !right || left === right || right.time <= left.time) return left;
         const ratio = Math.max(0, Math.min(1, (time - left.time) / (right.time - left.time)));
         return {{
-          points: left.points.map((point, index) => {{
-            const next = right.points[index] || point;
-            return point.map((value, axis) => value + (next[axis] - value) * ratio);
-          }}),
+          points: Object.fromEntries(Object.entries(left.points).map(([name, point]) => {{
+            const next = right.points[name] || point;
+            return [name, point.map((value, axis) => value + (next[axis] - value) * ratio)];
+          }})),
         }};
       }};
       const drawPose = (time) => {{
@@ -467,7 +748,7 @@ def _render_html(ir: dict[str, Any], pose_frames: list[dict[str, Any]], profile:
           poseContext.lineTo(b[0] * poseCanvas.width, b[1] * poseCanvas.height);
           poseContext.stroke();
         }}
-        for (const point of frame.points) {{
+        for (const point of Object.values(frame.points)) {{
           if (point[2] < 0.35) continue;
           poseContext.beginPath();
           poseContext.arc(point[0] * poseCanvas.width, point[1] * poseCanvas.height, 5, 0, Math.PI * 2);
@@ -755,10 +1036,14 @@ def generate_projects(
         pose_frames = [
             {
                 "time": round(float(observation["sourceTimeMs"]) / 1000.0, 6),
-                "points": [
-                    [round(float(point["x"]), 6), round(float(point["y"]), 6), round(float(point["visibility"]), 6)]
+                "points": {
+                    str(point["name"]): [
+                        round(float(point["x"]), 6),
+                        round(float(point["y"]), 6),
+                        round(float(point["visibility"]), 6),
+                    ]
                     for point in observation["screenSpace"]["keypoints"]
-                ],
+                },
             }
             for observation in observations
         ]
