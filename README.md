@@ -16,6 +16,8 @@ local video
 
 It is designed for AI agents to use through a general `SKILL.md`, while the actual work remains explicit, local, and reproducible through a CLI. Natural-language direction is converted by the calling agent into a validated `EditSpec`; the CLI never silently interprets or ignores free text.
 
+Rendering is intentionally out of scope: this project produces generated source and data, an external renderer (for example the HyperFrames CLI) produces the video, and `verify` measures that externally rendered file against the resolved coordinates.
+
 ## Status
 
 The first executable vertical slice is included:
