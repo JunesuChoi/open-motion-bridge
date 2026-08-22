@@ -1,6 +1,6 @@
 # open-motion-bridge
 
-> Local-first, Skill-First video-to-code harness for tracked motion graphics and sketch animation.
+> Local-first, Skill-First media-to-code harness for tracked motion graphics, photo motion, and sketch animation.
 
 `open-motion-bridge` turns a locally supplied video into a reviewable motion-data project:
 
@@ -13,6 +13,8 @@ local video
   -> HyperFrames project + SVG sketch project
   -> optional Remotion adapter
 ```
+
+It also turns a local still image into either coordinate-controlled photo motion or a progressive ink-to-color drawing project. Still-image drawing uses ordered SVG ink paths, broad wash strokes, edge-aligned detail strokes, and an optional speed-limited close-up camera.
 
 It is designed for AI agents to use through a general `SKILL.md`, while the actual work remains explicit, local, and reproducible through a CLI. Natural-language direction is converted by the calling agent into a validated `EditSpec`; the CLI never silently interprets or ignores free text.
 
@@ -28,7 +30,9 @@ The first executable vertical slice is included:
 - deterministic HyperFrames source generation with a source-video pose overlay;
 - declarative asset binding (EditSpec): attach text or image assets to named landmarks with confidence-aware fade/hide/hold, bbox-relative scaling, landmark-pair rotation, and per-frame speed clamping, resolved into an auditable `bindings.resolved.json`;
 - render reprojection verification (`verify`): re-measures where staged image assets actually landed in a rendered video against their resolved coordinates using masked template matching, and writes a pass/fail report;
-- exact SVG skeleton trace export.
+- exact SVG skeleton trace export;
+- still-image analysis and MotionSpec-driven photo projects;
+- progressive still-image drawing with deterministic ink paths, source-color brush masks, a visible tool path, and `pen-follow` or smoother `phase-focus` close-up modes.
 
 It is intentionally narrow. Automatic object tracking, camera stabilization, browser patch review, generic EditSpec resolution, Remotion export, and social-platform reframing remain roadmap items. The implemented commands are labelled below; unsupported commands must fail explicitly rather than imply that they worked.
 
@@ -46,6 +50,7 @@ It is intentionally narrow. Automatic object tracking, camera stabilization, bro
 | --- | --- |
 | HyperFrames | Primary HTML-based, deterministic motion-graphics project |
 | SVG sketch | Exact tracked paths followed by a rough/freehand styling pass |
+| Photo drawing | Ordered ink, brush-path coloring, and optional code-controlled close-up |
 | Remotion | Optional adapter for consumers who need a React-based export |
 
 The generator supports `source`, `youtube-16x9`, `youtube-shorts-9x16`, `instagram-reel-9x16`, `instagram-feed-4x5`, and fully custom canvas profiles. Profiles define canvas geometry and safe-area/reframing constraints; they are configurable rather than a claim of current platform certification.
@@ -58,6 +63,21 @@ python -m open_motion_bridge generate <analysis-dir>/tracking.ir.json `
   --source-video <local-video-path> --output <hyperframes-project-dir> --target both `
   --render-fps 30 --smoothing-profile balanced --force
 ```
+
+Still-image motion and drawing commands are separate so an agent cannot silently mix their intent:
+
+```powershell
+python -m open_motion_bridge analyze-image <local-photo-path> --output <photo-analysis-dir>
+python -m open_motion_bridge generate-photo <photo-analysis-dir>/tracking.ir.json `
+  --source-image <local-photo-path> --motion-spec <motion.spec.json> `
+  --output <photo-motion-project-dir>
+
+python -m open_motion_bridge sketch-image <local-photo-path> `
+  --output <drawing-project-dir> --duration-ms 16000 --color-mode paint `
+  --closeup-mode phase-focus --closeup-zoom 1.7
+```
+
+Use `--closeup-mode pen-follow` when the camera should track the drawing tool closely, `phase-focus` for slower regional framing, and `none` for a fixed full image. A non-zero `--closeup-zoom` without a mode remains a backward-compatible shortcut for `pen-follow`.
 
 For high-precision face and hand anchors, use the opt-in MMPose provider with **local** model assets. It never downloads a model or silently falls back to MediaPipe:
 

@@ -17,7 +17,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
 
-    analyze = subcommands.add_parser("analyze", help="Create immutable source manifest and Tracking IR.")
+    analyze = subcommands.add_parser(
+        "analyze", help="Create immutable source manifest and Tracking IR."
+    )
     analyze.add_argument("video", type=_path)
     analyze.add_argument("--output", type=_path, required=True)
     analyze.add_argument(
@@ -32,23 +34,54 @@ def build_parser() -> argparse.ArgumentParser:
         default="mediapipe",
         help="Pose provider. MMPose requires explicit local config and checkpoint files.",
     )
-    analyze.add_argument("--mmpose-pose-config", type=_path, help="Local RTMPose-L WholeBody config path.")
-    analyze.add_argument("--mmpose-pose-weights", type=_path, help="Local RTMPose-L WholeBody checkpoint path.")
-    analyze.add_argument("--mmpose-detector-config", type=_path, help="Local person-detector config path.")
-    analyze.add_argument("--mmpose-detector-weights", type=_path, help="Local person-detector checkpoint path.")
-    analyze.add_argument("--mmpose-device", default="cuda:0", help="MMPose device, for example cuda:0 or cpu.")
+    analyze.add_argument(
+        "--mmpose-pose-config",
+        type=_path,
+        help="Local RTMPose-L WholeBody config path.",
+    )
+    analyze.add_argument(
+        "--mmpose-pose-weights",
+        type=_path,
+        help="Local RTMPose-L WholeBody checkpoint path.",
+    )
+    analyze.add_argument(
+        "--mmpose-detector-config",
+        type=_path,
+        help="Local person-detector config path.",
+    )
+    analyze.add_argument(
+        "--mmpose-detector-weights",
+        type=_path,
+        help="Local person-detector checkpoint path.",
+    )
+    analyze.add_argument(
+        "--mmpose-device",
+        default="cuda:0",
+        help="MMPose device, for example cuda:0 or cpu.",
+    )
     analyze.add_argument("--force", action="store_true")
 
     generate = subcommands.add_parser(
-        "generate", help="Generate a HyperFrames project and/or SVG skeleton trace from Tracking IR."
+        "generate",
+        help="Generate a HyperFrames project and/or SVG skeleton trace from Tracking IR.",
     )
     generate.add_argument("ir", type=_path)
     generate.add_argument("--source-video", type=_path, required=True)
     generate.add_argument("--output", type=_path, required=True)
-    generate.add_argument("--target", choices=("hyperframes", "sketch-svg", "both"), default="both")
-    generate.add_argument("--profile", default="source", choices=("source", "youtube-shorts-9x16", "instagram-reel-9x16"))
+    generate.add_argument(
+        "--target", choices=("hyperframes", "sketch-svg", "both"), default="both"
+    )
+    generate.add_argument(
+        "--profile",
+        default="source",
+        choices=("source", "youtube-shorts-9x16", "instagram-reel-9x16"),
+    )
     generate.add_argument("--render-fps", type=float, default=30.0)
-    generate.add_argument("--smoothing-profile", choices=("responsive", "balanced", "stable"), default="balanced")
+    generate.add_argument(
+        "--smoothing-profile",
+        choices=("responsive", "balanced", "stable"),
+        default="balanced",
+    )
     generate.add_argument("--visibility-threshold", type=float, default=0.2)
     generate.add_argument("--max-gap-ms", type=float, default=250.0)
     generate.add_argument(
@@ -68,7 +101,9 @@ def build_parser() -> argparse.ArgumentParser:
         "verify",
         help="Measure where bindings actually landed in a rendered file against their resolved coordinates.",
     )
-    verify.add_argument("project", type=_path, help="Generated HyperFrames project directory.")
+    verify.add_argument(
+        "project", type=_path, help="Generated HyperFrames project directory."
+    )
     verify.add_argument("--rendered-video", type=_path, required=True)
     verify.add_argument("--output", type=_path, required=True)
     verify.add_argument("--samples", type=int, default=8)
@@ -76,7 +111,8 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--force", action="store_true")
 
     analyze_image = subcommands.add_parser(
-        "analyze-image", help="Create a single-observation Tracking IR from a still photo."
+        "analyze-image",
+        help="Create a single-observation Tracking IR from a still photo.",
     )
     analyze_image.add_argument("image", type=_path)
     analyze_image.add_argument("--output", type=_path, required=True)
@@ -107,13 +143,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--color-mode",
         choices=("none", "paint"),
         default="none",
-        help="'paint' adds a human-like coloring pass (brush stamps sampled from the photo) after line drawing.",
+        help="'paint' adds broad wash and edge-aligned detail brush paths after line drawing.",
+    )
+    sketch_image.add_argument(
+        "--closeup-mode",
+        choices=("none", "pen-follow", "phase-focus"),
+        default=None,
+        help="Close-up behavior. pen-follow tracks the tool; phase-focus holds smoother regional close-ups.",
     )
     sketch_image.add_argument(
         "--closeup-zoom",
         type=float,
         default=0.0,
-        help="Follow the pen with a close-up camera at this zoom (e.g. 1.8). 0 disables.",
+        help="Close-up zoom (1.0-3.0). For compatibility, a non-zero value without --closeup-mode selects pen-follow.",
     )
     sketch_image.add_argument("--force", action="store_true")
     return parser
@@ -130,10 +172,13 @@ def main(argv: list[str] | None = None) -> int:
                 "--mmpose-detector-config": args.mmpose_detector_config,
                 "--mmpose-detector-weights": args.mmpose_detector_weights,
             }
-            missing_assets = [flag for flag, path in required_assets.items() if path is None]
+            missing_assets = [
+                flag for flag, path in required_assets.items() if path is None
+            ]
             if missing_assets:
                 raise ValueError(
-                    "MMPose provider requires explicit local assets: " + ", ".join(missing_assets)
+                    "MMPose provider requires explicit local assets: "
+                    + ", ".join(missing_assets)
                 )
             mmpose_options = MMPoseOptions(
                 pose_config=args.mmpose_pose_config,
@@ -201,12 +246,13 @@ def main(argv: list[str] | None = None) -> int:
             photo_fade_ms=args.photo_fade_ms,
             max_strokes=args.max_strokes,
             color_mode=args.color_mode,
+            closeup_mode=args.closeup_mode,
             closeup_zoom=args.closeup_zoom,
             force=args.force,
         )
         print(
             f"strokes={plan['vectorization']['strokeCount']} inkPx={plan['vectorization']['totalInkPx']} "
-            f"stamps={plan['coloring']['stampCount']} camera={plan['camera']['mode']}"
+            f"brushStrokes={plan['coloring']['brushStrokeCount']} camera={plan['camera']['mode']}"
         )
         return 0
     raise AssertionError(f"Unhandled command: {args.command}")

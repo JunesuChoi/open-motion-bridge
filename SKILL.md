@@ -1,11 +1,11 @@
 ---
 name: open-motion-bridge
-description: Analyze a local video into reviewable pose tracking data, bind text or image assets to named landmarks through a declarative EditSpec, generate HyperFrames or SVG sketch projects, and verify an externally rendered result by reprojecting resolved coordinates onto the rendered pixels. Use for video-to-code motion reconstruction, coordinate-verified overlays, and tracked sketch animation. This Skill does not render video and does not upload or publish media.
+description: Analyze a local video into reviewable pose tracking data, turn a still photo into code-controlled motion or a progressive ink-and-paint drawing, bind assets through declarative specs, and generate HyperFrames or SVG projects for external rendering. Use for video-to-code reconstruction, coordinate-verified overlays, photo motion graphics, and tracked or still-image sketch animation. This Skill does not render, upload, or publish media.
 ---
 
 # Open Motion Bridge
 
-Use this Skill when a user wants an existing local video reconstructed as code-controlled motion graphics, tracked SVG sketch animation, or both. The goal is a reviewable data-to-code workflow, not a claim that a generated visual exactly recreates unverified footage.
+Use this Skill when a user wants an existing local video reconstructed as code-controlled motion graphics, or a local photo converted into coordinate-controlled motion graphics or a progressive drawing. The goal is a reviewable data-to-code workflow, not a claim that generated pixels exactly recreate unverified media.
 
 **Scope boundary — no rendering.** This Skill produces data and generated source (Tracking IR, resolved bindings, a HyperFrames project, SVG). Turning the generated project into an mp4 is the responsibility of an external renderer (for example the HyperFrames CLI) invoked by the calling agent, outside this Skill. The Skill's own `verify` command then measures that externally rendered file; it never claims a render it did not inspect.
 
@@ -27,11 +27,22 @@ analyze -> author EditSpec -> generate (resolves bindings)
 -> verify (reprojection against the rendered file) -> report
 ```
 
+Still-image branches:
+
+```text
+analyze-image -> author MotionSpec -> generate-photo -> [external render]
+photo -> sketch-image (ink -> optional brush-path color -> optional close-up) -> [external render]
+```
+
 - `python -m open_motion_bridge analyze <video> --output <dir>` creates the source manifest and immutable `tracking.ir.json`. Never mutate that file afterwards.
 - Author `edits.spec.json` from the user's direction. Bindings attach `text` or `image` assets to named landmarks with `onLowConfidence` (fade/hide/hold), bbox-relative `scale`, landmark-pair `rotate`, time `range`, and `maxSpeed` clamping. See [EditSpec](docs/edit-spec.md).
 - `python -m open_motion_bridge generate <tracking-ir> --source-video <video> --output <project> --edit-spec <spec> --overlay bindings` writes the HyperFrames project plus `bindings.resolved.json` (the auditable per-frame transform table) and `render.tracking.ir.json`. Use `--overlay skeleton` for diagnostics, `both` for review. `--target sketch-svg` emits the exact SVG trace.
 - Rendering the generated project is not part of this Skill. Hand the project directory to the external renderer chosen by the user or calling workflow.
 - `python -m open_motion_bridge verify <project> --rendered-video <mp4> --output <report.json>` re-measures where staged image assets actually landed in the rendered pixels against `bindings.resolved.json` and writes a pass/fail report with per-sample pixel errors. Text bindings are reported as not measurable; verify them with an inspected extracted frame instead of implying a measured pass.
+- `python -m open_motion_bridge analyze-image <photo> --output <dir>` creates still-image analysis data. Pair it with `generate-photo`, a reviewed MotionSpec, and the same external-render boundary.
+- `python -m open_motion_bridge sketch-image <photo> --output <project> --color-mode paint --closeup-mode phase-focus` creates an auditable HyperFrames drawing project. `pen-follow` tracks the current tool closely; `phase-focus` holds slower regional close-ups; `none` keeps a full-frame view. `--closeup-zoom` accepts values above 1.0 through 3.0. For compatibility, specifying only a non-zero zoom selects `pen-follow`.
+
+The sketch plan must retain ordered ink paths, broad and detail brush paths, the tool-position table, and any camera table. Coloring uses a progressive path mask over the source image; do not replace it with independently sampled circle stamps, which create visible mosaic motion and break color continuity.
 
 ## Review policy
 
@@ -43,6 +54,7 @@ If a condition fails, mark the affected range `needs-review`. Offer re-analysis,
 
 - **HyperFrames:** primary target for deterministic HTML composition; preserve generated source maps back to IR/patch operations.
 - **SVG sketch:** use exact tracked paths first, then apply rough/freehand styling as a separate, configurable pass.
+- **Still-photo drawing:** use measured SVG paths for ink, deterministic brush paths for color, and a single speed-limited camera wrapper for optional close-up. Keep the paper background outside that wrapper.
 - **Remotion:** optional adapter only; never replace the HyperFrames source of truth.
 
 Choose `screenSpace` for graphics that move with the original frame and `stabilizedSpace` for world-pinned graphics. If camera confidence is insufficient, retain screen-space behavior and disclose the limitation.

@@ -2,18 +2,20 @@
 
 This roadmap intentionally puts data contracts, reviewability, and test fixtures before model breadth or generated visual polish. A phase is not complete until its stated evidence exists.
 
-Direction note (2026-08): the core loop — analyze, EditSpec asset binding, deterministic generation, and render reprojection verification — is implemented. Video rendering itself is explicitly out of scope for this project: generated projects are handed to an external renderer, and this project verifies the externally rendered result. The phases below are re-prioritized around that boundary: verification depth first, then expressive breadth, then skill packaging.
+Direction note (2026-08): the core video loop — analyze, EditSpec asset binding, deterministic generation, and render reprojection verification — is implemented. Still-image analysis, MotionSpec generation, and progressive ink-to-brush drawing with selectable close-up modes are also implemented. Video rendering itself is explicitly out of scope for this project: generated projects are handed to an external renderer, and this project verifies the externally rendered result. The phases below are re-prioritized around that boundary: verification depth first, then subject-aware still-image layers, expressive breadth, and skill packaging.
 
 ## Next priorities
 
 1. **Text binding verification.** Rasterize text bindings to transparent PNGs at generate time so `verify` can template-match them like images, closing the "not measurable" gap and removing browser font dependence from the visual result.
 2. **Synthetic fixture end-to-end tests.** Programmatically generated motion clips (known ground-truth coordinates, no real people) driving analyze -> generate -> verify in CI, asserting pixel error bounds numerically.
 3. **Failure diagnostics.** On an out-of-tolerance `verify` sample, save a side-by-side diagnostic image (expected vs. measured position) next to the report.
-4. **Camera motion provider.** Optical-flow/homography estimation to enable `stabilizedSpace` (world-pinned graphics).
-5. **Binding kinds.** Landmark-pair lines/arrows, joint-angle labels, and motion trails — all derivable from the existing IR.
-6. **Multi-person tracks.** Persist multiple IoU-matched tracks so an EditSpec can target `person-002`.
-7. **Workspace convention and one-command flow.** `runs/<source-hash>/` caching plus a single orchestration command covering analyze -> generate (verify stays a separate, post-external-render step).
-8. **NL -> EditSpec example corpus.** Korean/English instruction-to-spec pairs under `integrations/` so Codex and Claude translate direction consistently.
+4. **Subject-aware photo layers.** Add opt-in local segmentation and depth ordering so hair, face, clothing, and background can receive independent parallax, brush order, and occlusion-aware close-ups without pretending whole-image effects isolate regions.
+5. **Drawing verification.** Add synthetic paint-mask fixtures that assert monotonic revealed area, final full-frame camera release, and brush/tool alignment numerically in addition to inspected snapshots.
+6. **Camera motion provider.** Optical-flow/homography estimation to enable `stabilizedSpace` (world-pinned graphics).
+7. **Binding kinds.** Landmark-pair lines/arrows, joint-angle labels, and motion trails — all derivable from the existing IR.
+8. **Multi-person tracks.** Persist multiple IoU-matched tracks so an EditSpec can target `person-002`.
+9. **Workspace convention and one-command flow.** `runs/<source-hash>/` caching plus a single orchestration command covering analyze -> generate (verify stays a separate, post-external-render step).
+10. **NL -> EditSpec/MotionSpec example corpus.** Korean/English instruction-to-spec pairs under `integrations/` so Codex and Claude translate equivalent direction consistently.
 
 ## Phase 0 — Repository and reproducible contracts
 
