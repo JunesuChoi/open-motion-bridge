@@ -141,9 +141,13 @@ def build_parser() -> argparse.ArgumentParser:
     sketch_image.add_argument("--max-strokes", type=int, default=900)
     sketch_image.add_argument(
         "--color-mode",
-        choices=("none", "paint"),
+        choices=("none", "paint", "reveal", "sampled-strokes", "hybrid-paint"),
         default="none",
-        help="'paint' adds broad wash and edge-aligned detail brush paths after line drawing.",
+        help=(
+            "Coloring after line drawing: sampled-strokes paints stored RGB strokes; "
+            "hybrid-paint adds a subtle source-texture finish; reveal (legacy alias: paint) "
+            "reveals source pixels through brush masks."
+        ),
     )
     sketch_image.add_argument(
         "--closeup-mode",

@@ -3,9 +3,9 @@ optionally followed by a human-like coloring pass and a close-up camera that
 follows the pen.
 
 Pipeline: edges -> polyline strokes -> coarse-to-fine ordering with
-nearest-neighbour pen travel -> per-stroke timing. Coloring reveals the source
-photo through deterministic brush-path masks: broad alternating wash strokes
-first, then short edge-aligned detail strokes. The close-up camera follows the
+nearest-neighbour pen travel -> per-stroke timing. Coloring can either preserve
+the legacy source-reveal masks or paint deterministic, locally sampled RGB
+strokes ordered by Lab-aware image regions. The close-up camera follows the
 precomputed pen/brush position with smoothing, speed limiting, and edge
 clamping. Everything — ink strokes, brush strokes, tool positions, and the
 camera table — is written to `sketch.plan.json` so the result stays
@@ -269,6 +269,169 @@ def _paint_brush_strokes(
     return wash + detail
 
 
+def _lab_distance(
+    a: tuple[float, float, float], b: tuple[float, float, float]
+) -> float:
+    return math.sqrt(sum((left - right) ** 2 for left, right in zip(a, b, strict=True)))
+
+
+def _sampled_color_strokes(
+    work: np.ndarray,
+    start_ms: float,
+    paint_ms: float,
+    start_point: tuple[float, float],
+) -> list[dict[str, Any]]:
+    """Paint the image with real RGB strokes ordered by local Lab regions.
+
+    A deterministic grid avoids an optional segmentation dependency. Adjacent
+    cells with similar Lab medians become regions; regions and cells are then
+    traversed from the final ink coordinate with nearest-neighbour travel. Each
+    stroke stores the RGB color it actually renders, so the plan can be audited
+    without sampling the source again in the browser.
+    """
+    height, width = work.shape[:2]
+    blurred = cv2.GaussianBlur(work, (0, 0), 1.35)
+    lab_image = cv2.cvtColor(blurred, cv2.COLOR_BGR2LAB)
+    gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+
+    cell = max(14, int(math.ceil(max(width, height) / 38.0)))
+    cells: list[dict[str, Any]] = []
+    by_grid: dict[tuple[int, int], int] = {}
+    for gy, y0 in enumerate(range(0, height, cell)):
+        for gx, x0 in enumerate(range(0, width, cell)):
+            x1, y1 = min(width, x0 + cell), min(height, y0 + cell)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            color_patch = blurred[y0:y1, x0:x1]
+            lab_patch = lab_image[y0:y1, x0:x1]
+            b, g, r = np.median(color_patch.reshape(-1, 3), axis=0)
+            lab = tuple(
+                float(value) for value in np.median(lab_patch.reshape(-1, 3), axis=0)
+            )
+            cx, cy = (x0 + x1 - 1) / 2.0, (y0 + y1 - 1) / 2.0
+            px, py = int(round(cx)), int(round(cy))
+            tangent = (
+                math.atan2(float(grad_y[py, px]), float(grad_x[py, px])) + math.pi / 2.0
+            )
+            index = len(cells)
+            by_grid[(gx, gy)] = index
+            cells.append(
+                {
+                    "index": index,
+                    "grid": (gx, gy),
+                    "center": (cx / width, cy / height),
+                    "lab": lab,
+                    "color": f"#{int(r):02x}{int(g):02x}{int(b):02x}",
+                    "angle": tangent,
+                    "cellPx": min(x1 - x0, y1 - y0),
+                }
+            )
+
+    # Flood-fill locally coherent color regions. The threshold is deliberately
+    # broad enough for photographic gradients while keeping skin, hair, clothes,
+    # and background from collapsing into one top-to-bottom sweep.
+    unassigned = set(range(len(cells)))
+    regions: list[list[int]] = []
+    cell_regions: dict[int, int] = {}
+    while unassigned:
+        seed = min(unassigned)
+        unassigned.remove(seed)
+        queue = [seed]
+        region = [seed]
+        queue_cursor = 0
+        while queue_cursor < len(queue):
+            current = queue[queue_cursor]
+            queue_cursor += 1
+            gx, gy = cells[current]["grid"]
+            for neighbour_grid in (
+                (gx - 1, gy),
+                (gx + 1, gy),
+                (gx, gy - 1),
+                (gx, gy + 1),
+            ):
+                neighbour = by_grid.get(neighbour_grid)
+                if neighbour not in unassigned:
+                    continue
+                if (
+                    _lab_distance(cells[current]["lab"], cells[neighbour]["lab"])
+                    <= 24.0
+                ):
+                    unassigned.remove(neighbour)
+                    queue.append(neighbour)
+                    region.append(neighbour)
+        region_id = len(regions)
+        regions.append(region)
+        for cell_index in region:
+            cell_regions[cell_index] = region_id
+
+    pen = start_point
+    ordered_cells: list[int] = []
+    remaining_regions = list(regions)
+    while remaining_regions:
+        region_index = min(
+            range(len(remaining_regions)),
+            key=lambda ri: min(
+                math.hypot(
+                    cells[ci]["center"][0] - pen[0], cells[ci]["center"][1] - pen[1]
+                )
+                for ci in remaining_regions[ri]
+            ),
+        )
+        region = remaining_regions.pop(region_index)
+        remaining_cells = list(region)
+        while remaining_cells:
+            chosen_index = min(
+                range(len(remaining_cells)),
+                key=lambda ci: math.hypot(
+                    cells[remaining_cells[ci]]["center"][0] - pen[0],
+                    cells[remaining_cells[ci]]["center"][1] - pen[1],
+                ),
+            )
+            chosen = remaining_cells.pop(chosen_index)
+            ordered_cells.append(chosen)
+            pen = cells[chosen]["center"]
+
+    strokes: list[dict[str, Any]] = []
+    pen = start_point
+    for order, cell_index in enumerate(ordered_cells):
+        item = cells[cell_index]
+        cx, cy = item["center"]
+        angle = float(item["angle"])
+        if not math.isfinite(angle):
+            angle = (_noise01(order, 41) - 0.5) * math.pi
+        half_length = float(item["cellPx"]) * (0.70 + _noise01(order, 43) * 0.15)
+        dx = math.cos(angle) * half_length / width
+        dy = math.sin(angle) * half_length / height
+        a, b = (cx - dx, cy - dy), (cx + dx, cy + dy)
+        if math.hypot(b[0] - pen[0], b[1] - pen[1]) < math.hypot(
+            a[0] - pen[0], a[1] - pen[1]
+        ):
+            a, b = b, a
+        x0, y0 = min(1.0, max(0.0, a[0])), min(1.0, max(0.0, a[1]))
+        x1, y1 = min(1.0, max(0.0, b[0])), min(1.0, max(0.0, b[1]))
+        strokes.append(
+            {
+                "pass": "sampled",
+                "region": cell_regions[cell_index],
+                "x0": round(x0, 5),
+                "y0": round(y0, 5),
+                "x1": round(x1, 5),
+                "y1": round(y1, 5),
+                "width": round(float(item["cellPx"]) * 0.82 / width, 5),
+                "opacity": 0.9,
+                "sampledColor": item["color"],
+                "color": item["color"],
+                "lab": [round(value, 2) for value in item["lab"]],
+            }
+        )
+        pen = (x1, y1)
+
+    _schedule_brush_pass(strokes, start_ms, paint_ms, 0)
+    return strokes
+
+
 def _position_table(
     strokes: list[dict[str, Any]],
     paint_strokes: list[dict[str, Any]],
@@ -437,8 +600,13 @@ def generate_sketch_project(
 ) -> dict[str, Any]:
     if not source_image.is_file():
         raise FileNotFoundError(f"Source image not found: {source_image}")
-    if color_mode not in {"none", "paint"}:
-        raise ValueError("color_mode must be 'none' or 'paint'")
+    color_modes = {"none", "paint", "reveal", "sampled-strokes", "hybrid-paint"}
+    if color_mode not in color_modes:
+        raise ValueError(
+            "color_mode must be 'none', 'paint', 'reveal', "
+            "'sampled-strokes', or 'hybrid-paint'"
+        )
+    resolved_color_mode = "reveal" if color_mode == "paint" else color_mode
     resolved_closeup_mode = closeup_mode or ("pen-follow" if closeup_zoom else "none")
     if resolved_closeup_mode not in {"none", "pen-follow", "phase-focus"}:
         raise ValueError("closeup_mode must be 'none', 'pen-follow', or 'phase-focus'")
@@ -476,13 +644,18 @@ def generate_sketch_project(
         )
 
     active_ms = duration_ms - hold_ms - photo_fade_ms
-    draw_ms = active_ms * (0.45 if color_mode == "paint" else 1.0)
-    paint_ms = active_ms - draw_ms if color_mode == "paint" else 0.0
+    has_color_phase = resolved_color_mode != "none"
+    draw_ms = active_ms * (0.45 if has_color_phase else 1.0)
+    paint_ms = active_ms - draw_ms if has_color_phase else 0.0
     gap_ms = min(28.0, draw_ms * 0.15 / max(1, len(ordered)))
     scheduled = _schedule(ordered, 0.0, draw_ms, gap_ms, "stroke")
-    paint_strokes = (
-        _paint_brush_strokes(work, draw_ms, paint_ms) if color_mode == "paint" else []
-    )
+    if resolved_color_mode == "reveal":
+        paint_strokes = _paint_brush_strokes(work, draw_ms, paint_ms)
+    elif resolved_color_mode in {"sampled-strokes", "hybrid-paint"}:
+        final_ink_point = tuple(map(float, scheduled[-1]["points"][-1]))
+        paint_strokes = _sampled_color_strokes(work, draw_ms, paint_ms, final_ink_point)
+    else:
+        paint_strokes = []
 
     camera: list[dict[str, float]] = []
     positions = _position_table(scheduled, paint_strokes, duration_ms, fps)
@@ -521,9 +694,31 @@ def generate_sketch_project(
         },
         "coloring": {
             "mode": color_mode,
+            "resolvedMode": resolved_color_mode,
             "brushStrokeCount": len(paint_strokes),
-            "passes": ["alternating broad wash", "edge-aligned detail"],
-            "rendering": "source image revealed through progressive brush-path mask",
+            "passes": (
+                ["alternating broad wash", "edge-aligned detail"]
+                if resolved_color_mode == "reveal"
+                else (
+                    ["Lab-region ordered RGB sampled strokes"]
+                    if has_color_phase
+                    else []
+                )
+            ),
+            "rendering": (
+                "source image revealed through progressive brush-path mask"
+                if resolved_color_mode == "reveal"
+                else (
+                    "actual RGB canvas strokes with a subtle source texture finish"
+                    if resolved_color_mode == "hybrid-paint"
+                    else "actual RGB canvas strokes; source pixels are not used as a paint mask"
+                )
+            ),
+            "textureMix": (
+                0.14
+                if resolved_color_mode == "hybrid-paint"
+                else (1.0 if resolved_color_mode in {"none", "reveal"} else 0.0)
+            ),
         },
         "camera": {
             "mode": resolved_closeup_mode,
@@ -556,6 +751,16 @@ def generate_sketch_project(
         )
     html_path.write_text(_render_sketch_html(plan, staged.name), encoding="utf-8")
     _write_json(
+        output_dir / "package.json",
+        {
+            "name": "open-motion-bridge-sketch",
+            "private": True,
+            "version": "0.0.0",
+            "dependencies": {"gsap": "3.13.0"},
+        },
+        force,
+    )
+    _write_json(
         output_dir / "index.motion.json",
         {
             "duration": round(duration_ms / 1000.0, 3),
@@ -585,6 +790,7 @@ def generate_sketch_project(
             "closeupMode": resolved_closeup_mode,
             "closeupZoom": closeup_zoom,
             "motionSidecar": "index.motion.json",
+            "runtimeInstall": "npm install",
         },
         force,
     )
@@ -624,6 +830,7 @@ def _render_sketch_html(plan: dict[str, Any], staged_image_name: str) -> str:
                 "w": s["width"],
                 "a": s["opacity"],
                 "p": s["pass"],
+                "c": s.get("color", s.get("sampledColor", "#ffffff")),
                 "s": s["startMs"],
                 "d": s["durationMs"],
             }
@@ -633,6 +840,102 @@ def _render_sketch_html(plan: dict[str, Any], staged_image_name: str) -> str:
     )
     tool_json = json.dumps(plan["toolTable"], separators=(",", ":"))
     camera_json = json.dumps(plan["cameraTable"], separators=(",", ":"))
+    color_mode = str(plan["coloring"].get("resolvedMode", plan["coloring"]["mode"]))
+    texture_mix = float(plan["coloring"].get("textureMix", 0.0))
+    if color_mode == "reveal":
+        paint_renderer_js = """
+      const drawPaintLayer = (targetCtx, passName, t) => {
+        targetCtx.clearRect(0, 0, W, H);
+        let hasPaint = false;
+        targetCtx.globalCompositeOperation = 'source-over';
+        targetCtx.strokeStyle = '#ffffff';
+        targetCtx.lineCap = 'round';
+        targetCtx.lineJoin = 'round';
+        for (const s of paintStrokes) {
+          if (s.p !== passName) continue;
+          const p = Math.max(0, Math.min(1, (t - s.s) / s.d));
+          if (p <= 0) continue;
+          hasPaint = true;
+          const e = p * p * (3 - 2 * p);
+          const x0 = s.x0 * W, y0 = s.y0 * H;
+          let x1, y1, partialCx = null, partialCy = null;
+          if (s.cx !== null && s.cy !== null) {
+            const controlX = s.cx * W, controlY = s.cy * H;
+            partialCx = x0 + (controlX - x0) * e;
+            partialCy = y0 + (controlY - y0) * e;
+            const nextCx = controlX + (s.x1 * W - controlX) * e;
+            const nextCy = controlY + (s.y1 * H - controlY) * e;
+            x1 = partialCx + (nextCx - partialCx) * e;
+            y1 = partialCy + (nextCy - partialCy) * e;
+          } else {
+            x1 = (s.x0 + (s.x1 - s.x0) * e) * W;
+            y1 = (s.y0 + (s.y1 - s.y0) * e) * H;
+          }
+          const brushWidth = Math.max(2, s.w * W);
+          targetCtx.globalAlpha = s.a;
+          targetCtx.lineWidth = brushWidth;
+          targetCtx.shadowBlur = brushWidth * (s.p === 'wash' ? 0.24 : 0.12);
+          targetCtx.shadowColor = 'rgba(255,255,255,0.55)';
+          targetCtx.beginPath();
+          targetCtx.moveTo(x0, y0);
+          if (partialCx !== null) targetCtx.quadraticCurveTo(partialCx, partialCy, x1, y1);
+          else targetCtx.lineTo(x1, y1);
+          targetCtx.stroke();
+        }
+        targetCtx.shadowBlur = 0;
+        if (hasPaint && photo.complete && photo.naturalWidth > 0) {
+          targetCtx.globalCompositeOperation = 'source-in';
+          targetCtx.globalAlpha = 1;
+          targetCtx.drawImage(photo, 0, 0, W, H);
+        }
+        targetCtx.globalCompositeOperation = 'source-over';
+        targetCtx.globalAlpha = 1;
+      };
+      const drawPaint = (t) => {
+        drawPaintLayer(ctx, 'wash', t);
+        drawPaintLayer(detailCtx, 'detail', t);
+      };
+"""
+    else:
+        paint_renderer_js = """
+      const drawPaintLayer = (targetCtx, t) => {
+        targetCtx.clearRect(0, 0, W, H);
+        targetCtx.globalCompositeOperation = 'source-over';
+        targetCtx.lineCap = 'round';
+        targetCtx.lineJoin = 'round';
+        for (const s of paintStrokes) {
+          const p = Math.max(0, Math.min(1, (t - s.s) / s.d));
+          if (p <= 0) continue;
+          const e = p * p * (3 - 2 * p);
+          const x0 = s.x0 * W, y0 = s.y0 * H;
+          const x1 = (s.x0 + (s.x1 - s.x0) * e) * W;
+          const y1 = (s.y0 + (s.y1 - s.y0) * e) * H;
+          const brushWidth = Math.max(2, s.w * W);
+          targetCtx.globalAlpha = s.a;
+          targetCtx.strokeStyle = s.c;
+          targetCtx.lineWidth = brushWidth;
+          targetCtx.shadowBlur = brushWidth * 0.08;
+          targetCtx.shadowColor = s.c;
+          targetCtx.beginPath();
+          targetCtx.moveTo(x0, y0);
+          targetCtx.lineTo(x1, y1);
+          targetCtx.stroke();
+          targetCtx.globalAlpha = s.a * 0.28;
+          targetCtx.lineWidth = Math.max(1, brushWidth * 0.13);
+          targetCtx.shadowBlur = 0;
+          targetCtx.beginPath();
+          targetCtx.moveTo(x0, y0 - brushWidth * 0.22);
+          targetCtx.lineTo(x1, y1 - brushWidth * 0.22);
+          targetCtx.stroke();
+        }
+        targetCtx.shadowBlur = 0;
+        targetCtx.globalAlpha = 1;
+      };
+      const drawPaint = (t) => {
+        drawPaintLayer(ctx, t);
+        detailCtx.clearRect(0, 0, W, H);
+      };
+"""
 
     return f'''<!doctype html>
 <html lang="en">
@@ -652,8 +955,8 @@ def _render_sketch_html(plan: dict[str, Any], staged_image_name: str) -> str:
         radial-gradient(circle at 30% 20%, rgba(255,255,255,0.9), rgba(0,0,0,0) 60%),
         repeating-linear-gradient(0deg, rgba(0,0,0,0.012) 0 2px, rgba(0,0,0,0) 2px 4px), #f7f2e9; }}
       #paint, #paint-detail {{ position: absolute; inset: 0; }}
-      #paint {{ opacity: 0.82; }}
-      #paint-detail {{ opacity: 0.36; }}
+      #paint {{ opacity: {0.82 if color_mode == "reveal" else 0.96}; }}
+      #paint-detail {{ opacity: {0.36 if color_mode == "reveal" else 0}; }}
       #photo {{ position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0; }}
       #ink {{ position: absolute; inset: 0; }}
       #ink path {{ fill: none; stroke: #2b2620; stroke-width: 2.1; stroke-linecap: round; stroke-linejoin: round; opacity: 0.92; }}
@@ -707,69 +1010,7 @@ def _render_sketch_html(plan: dict[str, Any], staged_image_name: str) -> str:
       const detailCtx = detailPaintCanvas.getContext('2d');
       const cameraNode = document.getElementById('camera-world');
       const toolNode = document.getElementById('tool');
-      const drawPaintLayer = (targetCtx, passName, t) => {{
-        targetCtx.clearRect(0, 0, W, H);
-        let hasPaint = false;
-        targetCtx.globalCompositeOperation = 'source-over';
-        targetCtx.strokeStyle = '#ffffff';
-        targetCtx.lineCap = 'round';
-        targetCtx.lineJoin = 'round';
-        for (const s of paintStrokes) {{
-          if (s.p !== passName) continue;
-          const p = Math.max(0, Math.min(1, (t - s.s) / s.d));
-          if (p <= 0) continue;
-          hasPaint = true;
-          const e = p * p * (3 - 2 * p);
-          const x0 = s.x0 * W, y0 = s.y0 * H;
-          let x1, y1, partialCx = null, partialCy = null;
-          if (s.cx !== null && s.cy !== null) {{
-            const controlX = s.cx * W, controlY = s.cy * H;
-            partialCx = x0 + (controlX - x0) * e;
-            partialCy = y0 + (controlY - y0) * e;
-            const nextCx = controlX + (s.x1 * W - controlX) * e;
-            const nextCy = controlY + (s.y1 * H - controlY) * e;
-            x1 = partialCx + (nextCx - partialCx) * e;
-            y1 = partialCy + (nextCy - partialCy) * e;
-          }} else {{
-            x1 = (s.x0 + (s.x1 - s.x0) * e) * W;
-            y1 = (s.y0 + (s.y1 - s.y0) * e) * H;
-          }}
-          const brushWidth = Math.max(2, s.w * W);
-          targetCtx.globalAlpha = s.a;
-          targetCtx.lineWidth = brushWidth;
-          targetCtx.shadowBlur = brushWidth * (s.p === 'wash' ? 0.24 : 0.12);
-          targetCtx.shadowColor = 'rgba(255,255,255,0.55)';
-          targetCtx.beginPath();
-          targetCtx.moveTo(x0, y0);
-          if (partialCx !== null) targetCtx.quadraticCurveTo(partialCx, partialCy, x1, y1);
-          else targetCtx.lineTo(x1, y1);
-          targetCtx.stroke();
-          const length = Math.max(1, Math.hypot(x1 - x0, y1 - y0));
-          const nx = -(y1 - y0) / length, ny = (x1 - x0) / length;
-          for (const side of [-1, 1]) {{
-            const offset = brushWidth * 0.26 * side;
-            targetCtx.globalAlpha = s.a * 0.34;
-            targetCtx.lineWidth = brushWidth * 0.12;
-            targetCtx.shadowBlur = 0;
-            targetCtx.beginPath();
-            targetCtx.moveTo(x0 + nx * offset, y0 + ny * offset);
-            targetCtx.lineTo(x1 + nx * offset, y1 + ny * offset);
-            targetCtx.stroke();
-          }}
-        }}
-        targetCtx.shadowBlur = 0;
-        if (hasPaint && photo.complete && photo.naturalWidth > 0) {{
-          targetCtx.globalCompositeOperation = 'source-in';
-          targetCtx.globalAlpha = 1;
-          targetCtx.drawImage(photo, 0, 0, W, H);
-        }}
-        targetCtx.globalCompositeOperation = 'source-over';
-        targetCtx.globalAlpha = 1;
-      }};
-      const drawPaint = (t) => {{
-        drawPaintLayer(ctx, 'wash', t);
-        drawPaintLayer(detailCtx, 'detail', t);
-      }};
+{paint_renderer_js}
       const frameAt = (frames, timeSec) => {{
         if (!frames.length) return null;
         let lo = 0, hi = frames.length - 1;
@@ -808,8 +1049,8 @@ def _render_sketch_html(plan: dict[str, Any], staged_image_name: str) -> str:
         drawPaint(t);
         const fade = Math.max(0, Math.min(1, (t - DRAW_END) / Math.max(1, FADE_END - DRAW_END)));
         const eased = fade * fade * (3 - 2 * fade);
-        photo.style.opacity = String(eased);
-        document.getElementById('ink').style.opacity = String(1 - eased * 0.85);
+        photo.style.opacity = String(eased * {texture_mix:.3f});
+        document.getElementById('ink').style.opacity = String(1 - eased * {0.85 if color_mode == "reveal" else 0.68});
         applyCamera(timeSec);
         applyTool(timeSec, t);
       }};

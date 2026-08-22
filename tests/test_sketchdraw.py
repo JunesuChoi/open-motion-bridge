@@ -8,6 +8,7 @@ from open_motion_bridge.sketchdraw import (
     _camera_table,
     _paint_brush_strokes,
     _position_table,
+    _sampled_color_strokes,
     generate_sketch_project,
 )
 
@@ -42,6 +43,25 @@ def test_paint_plan_uses_long_brush_paths_and_is_deterministic():
     assert all(
         first[index]["startMs"] <= first[index + 1]["startMs"]
         for index in range(len(first) - 1)
+    )
+
+
+def test_sampled_color_plan_is_rgb_driven_deterministic_and_starts_near_pen():
+    image = _synthetic_portrait()
+    start = (0.82, 0.18)
+    first = _sampled_color_strokes(image, 1000.0, 4000.0, start)
+    second = _sampled_color_strokes(image, 1000.0, 4000.0, start)
+
+    assert first == second
+    assert first
+    assert {stroke["pass"] for stroke in first} == {"sampled"}
+    assert all(stroke["color"].startswith("#") for stroke in first)
+    assert all(stroke["sampledColor"] == stroke["color"] for stroke in first)
+    assert all(len(stroke["lab"]) == 3 for stroke in first)
+    distance = np.hypot(first[0]["x0"] - start[0], first[0]["y0"] - start[1])
+    assert distance < 0.08
+    assert first[-1]["startMs"] + first[-1]["durationMs"] == pytest.approx(
+        5000.0, abs=0.1
     )
     assert first[-1]["startMs"] + first[-1]["durationMs"] == pytest.approx(
         5000.0, abs=0.1
@@ -103,6 +123,7 @@ def test_generated_project_uses_brush_mask_and_explicit_closeup_mode(tmp_path):
     html = (output / "index.html").read_text(encoding="utf-8")
     saved_plan = json.loads((output / "sketch.plan.json").read_text(encoding="utf-8"))
     motion = json.loads((output / "index.motion.json").read_text(encoding="utf-8"))
+    package = json.loads((output / "package.json").read_text(encoding="utf-8"))
 
     assert plan["camera"]["mode"] == "phase-focus"
     assert plan["coloring"]["brushStrokeCount"] > 0
@@ -119,6 +140,57 @@ def test_generated_project_uses_brush_mask_and_explicit_closeup_mode(tmp_path):
         "bySec": 0.2,
     }
     assert motion["assertions"][1]["kind"] == "keepsMoving"
+    assert package["dependencies"] == {"gsap": "3.13.0"}
+
+
+@pytest.mark.parametrize(
+    ("color_mode", "expected_texture_mix"),
+    [("sampled-strokes", 0.0), ("hybrid-paint", 0.14)],
+)
+def test_generated_sampled_project_paints_colors_without_source_mask(
+    tmp_path, color_mode, expected_texture_mix
+):
+    source = tmp_path / "synthetic.png"
+    assert cv2.imwrite(str(source), _synthetic_portrait())
+    output = tmp_path / color_mode
+
+    plan = generate_sketch_project(
+        source,
+        output,
+        duration_ms=5000.0,
+        fps=12.0,
+        hold_ms=700.0,
+        photo_fade_ms=600.0,
+        max_strokes=120,
+        color_mode=color_mode,
+        closeup_mode="phase-focus",
+        closeup_zoom=1.6,
+    )
+    html = (output / "index.html").read_text(encoding="utf-8")
+
+    assert plan["coloring"]["resolvedMode"] == color_mode
+    assert plan["coloring"]["textureMix"] == expected_texture_mix
+    assert plan["paintStrokes"]
+    assert all("color" in stroke for stroke in plan["paintStrokes"])
+    assert "globalCompositeOperation = 'source-in'" not in html
+    assert "targetCtx.strokeStyle = s.c" in html
+    assert '"c":"#' in html
+
+
+def test_legacy_paint_alias_resolves_to_reveal(tmp_path):
+    source = tmp_path / "synthetic.png"
+    assert cv2.imwrite(str(source), _synthetic_portrait())
+    plan = generate_sketch_project(
+        source,
+        tmp_path / "legacy",
+        duration_ms=5000.0,
+        hold_ms=700.0,
+        photo_fade_ms=600.0,
+        color_mode="paint",
+    )
+    assert plan["coloring"]["mode"] == "paint"
+    assert plan["coloring"]["resolvedMode"] == "reveal"
+    assert plan["coloring"]["textureMix"] == 1.0
 
 
 def test_closeup_mode_and_zoom_conflict_fails_loudly(tmp_path):

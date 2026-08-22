@@ -31,7 +31,7 @@ Still-image branches:
 
 ```text
 analyze-image -> author MotionSpec -> generate-photo -> [external render]
-photo -> sketch-image (ink -> optional brush-path color -> optional close-up) -> [external render]
+photo -> sketch-image (ink -> optional RGB coordinate strokes -> optional close-up) -> [external render]
 ```
 
 - `python -m open_motion_bridge analyze <video> --output <dir>` creates the source manifest and immutable `tracking.ir.json`. Never mutate that file afterwards.
@@ -40,7 +40,8 @@ photo -> sketch-image (ink -> optional brush-path color -> optional close-up) ->
 - Rendering the generated project is not part of this Skill. Hand the project directory to the external renderer chosen by the user or calling workflow.
 - `python -m open_motion_bridge verify <project> --rendered-video <mp4> --output <report.json>` re-measures where staged image assets actually landed in the rendered pixels against `bindings.resolved.json` and writes a pass/fail report with per-sample pixel errors. Text bindings are reported as not measurable; verify them with an inspected extracted frame instead of implying a measured pass.
 - `python -m open_motion_bridge analyze-image <photo> --output <dir>` creates still-image analysis data. Pair it with `generate-photo`, a reviewed MotionSpec, and the same external-render boundary.
-- `python -m open_motion_bridge sketch-image <photo> --output <project> --color-mode paint --closeup-mode phase-focus` creates an auditable HyperFrames drawing project. `pen-follow` tracks the current tool closely; `phase-focus` holds slower regional close-ups; `none` keeps a full-frame view. `--closeup-zoom` accepts values above 1.0 through 3.0. For compatibility, specifying only a non-zero zoom selects `pen-follow`.
+- `python -m open_motion_bridge sketch-image <photo> --output <project> --color-mode sampled-strokes --closeup-mode phase-focus` creates an auditable HyperFrames drawing project. Prefer `sampled-strokes`: it groups adjacent cells in Lab space, stores their actual RGB values, starts near the final ink coordinate, and renders those colors as Canvas strokes instead of revealing the source through a mask. Use `hybrid-paint` only when a subtle source-texture finish is wanted. `reveal` and legacy alias `paint` preserve the old mask behavior. `pen-follow` tracks the current tool closely; `phase-focus` holds slower regional close-ups; `none` keeps a full-frame view. `--closeup-zoom` accepts values above 1.0 through 3.0. For compatibility, specifying only a non-zero zoom selects `pen-follow`.
+- Before checking, previewing, or rendering a generated drawing project, run `npm install` once in that generated directory. The generator pins GSAP in its local `package.json`; do not replace it with a network CDN because offline and deterministic rendering are required.
 
 The sketch plan must retain ordered ink paths, broad and detail brush paths, the tool-position table, and any camera table. Coloring uses a progressive path mask over the source image; do not replace it with independently sampled circle stamps, which create visible mosaic motion and break color continuity.
 
