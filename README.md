@@ -14,7 +14,7 @@ local video
   -> optional Remotion adapter
 ```
 
-It also turns a local still image into either coordinate-controlled photo motion or a progressive ink-to-color drawing project. Still-image drawing uses ordered SVG ink paths, Lab-grouped image regions, real RGB Canvas strokes, and an optional speed-limited close-up camera. The legacy source-reveal brush mode remains available for compatibility.
+It also turns a local still image into either coordinate-controlled photo motion or a progressive ink-to-color drawing project. Still-image drawing uses ordered SVG ink paths, deterministic RGB Canvas strokes, auditable completion metrics, and an optional speed-limited close-up camera. The recommended `residual-pigment` mode chooses each next stroke from the remaining coverage/color error, builds mass → form → accent, and ends with a contour lock, pigment settle, tool lift, camera release, and final hold. The legacy source-reveal brush mode remains available for compatibility.
 
 It is designed for AI agents to use through a general `SKILL.md`, while the actual work remains explicit, local, and reproducible through a CLI. Natural-language direction is converted by the calling agent into a validated `EditSpec`; the CLI never silently interprets or ignores free text.
 
@@ -32,7 +32,7 @@ The first executable vertical slice is included:
 - render reprojection verification (`verify`): re-measures where staged image assets actually landed in a rendered video against their resolved coordinates using masked template matching, and writes a pass/fail report;
 - exact SVG skeleton trace export;
 - still-image analysis and MotionSpec-driven photo projects;
-- progressive still-image drawing with deterministic ink paths, actual sampled RGB paint strokes, an optional hybrid texture finish, a visible tool path, and `pen-follow` or smoother `phase-focus` close-up modes.
+- progressive still-image drawing with deterministic ink paths; residual-driven mass, form, accent, and completion-lock RGB strokes; measured coverage/color-error completion; a visible tool path; and `pen-follow` or smoother `phase-focus` close-up modes.
 
 It is intentionally narrow. Automatic object tracking, camera stabilization, browser patch review, generic EditSpec resolution, Remotion export, and social-platform reframing remain roadmap items. The implemented commands are labelled below; unsupported commands must fail explicitly rather than imply that they worked.
 
@@ -50,7 +50,7 @@ It is intentionally narrow. Automatic object tracking, camera stabilization, bro
 | --- | --- |
 | HyperFrames | Primary HTML-based, deterministic motion-graphics project |
 | SVG sketch | Exact tracked paths followed by a rough/freehand styling pass |
-| Photo drawing | Ordered ink, RGB coordinate-stroke coloring, optional hybrid texture, and code-controlled close-up |
+| Photo drawing | Ordered ink, residual-driven RGB pigment fields, explicit completion lock/settle, and code-controlled close-up |
 | Remotion | Optional adapter for consumers who need a React-based export |
 
 The generator supports `source`, `youtube-16x9`, `youtube-shorts-9x16`, `instagram-reel-9x16`, `instagram-feed-4x5`, and fully custom canvas profiles. Profiles define canvas geometry and safe-area/reframing constraints; they are configurable rather than a claim of current platform certification.
@@ -73,11 +73,13 @@ python -m open_motion_bridge generate-photo <photo-analysis-dir>/tracking.ir.jso
   --output <photo-motion-project-dir>
 
 python -m open_motion_bridge sketch-image <local-photo-path> `
-  --output <drawing-project-dir> --duration-ms 16000 --color-mode sampled-strokes `
+  --output <drawing-project-dir> --duration-ms 16000 --color-mode residual-pigment `
   --closeup-mode phase-focus --closeup-zoom 1.7
 ```
 
-`sampled-strokes` is the recommended coloring mode: it stores and draws each sampled RGB color directly, ordered by locally coherent Lab regions beginning near the final ink coordinate. `hybrid-paint` uses the same strokes and adds only a subtle source-texture finish. `reveal` (and its legacy alias `paint`) retains the older source-image brush-mask behavior; `none` performs line drawing only before the final photo transition.
+`residual-pigment` is the recommended coloring mode. Python precomputes a seek-safe plan by repeatedly selecting the largest remaining coverage/color residual, weighted by structure and recorded face/hand importance heuristics. It stores real RGB and CIE Lab values, stroke importance, residual/coverage before and after every stroke, phase timings, coverage and hole measurements, and the final contour lock. Its generated HTML never draws or reveals source pixels: Canvas renders only the stored pigment paths and a deterministic settle pass. Camera release begins after settle and reaches full frame before the final hold.
+
+`sampled-strokes` remains available for the earlier Lab-region RGB traversal. `hybrid-paint` uses those sampled strokes and adds a subtle source-texture finish. `reveal` (and its legacy alias `paint`) retains the older source-image brush-mask behavior; `none` performs line drawing only before the final photo transition.
 
 Use `--closeup-mode pen-follow` when the camera should track the drawing tool closely, `phase-focus` for slower regional framing, and `none` for a fixed full image. A non-zero `--closeup-zoom` without a mode remains a backward-compatible shortcut for `pen-follow`.
 

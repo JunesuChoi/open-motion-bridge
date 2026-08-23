@@ -141,10 +141,18 @@ def build_parser() -> argparse.ArgumentParser:
     sketch_image.add_argument("--max-strokes", type=int, default=900)
     sketch_image.add_argument(
         "--color-mode",
-        choices=("none", "paint", "reveal", "sampled-strokes", "hybrid-paint"),
+        choices=(
+            "none",
+            "paint",
+            "reveal",
+            "sampled-strokes",
+            "hybrid-paint",
+            "residual-pigment",
+        ),
         default="none",
         help=(
-            "Coloring after line drawing: sampled-strokes paints stored RGB strokes; "
+            "Coloring after line drawing: residual-pigment resolves remaining coverage/color error "
+            "through mass, form, accent, and final-lock strokes; sampled-strokes paints stored RGB strokes; "
             "hybrid-paint adds a subtle source-texture finish; reveal (legacy alias: paint) "
             "reveals source pixels through brush masks."
         ),

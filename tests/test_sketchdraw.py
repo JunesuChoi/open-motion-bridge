@@ -8,6 +8,7 @@ from open_motion_bridge.sketchdraw import (
     _camera_table,
     _paint_brush_strokes,
     _position_table,
+    _residual_pigment_strokes,
     _sampled_color_strokes,
     generate_sketch_project,
 )
@@ -62,6 +63,60 @@ def test_sampled_color_plan_is_rgb_driven_deterministic_and_starts_near_pen():
     assert distance < 0.08
     assert first[-1]["startMs"] + first[-1]["durationMs"] == pytest.approx(
         5000.0, abs=0.1
+    )
+
+
+def test_residual_pigment_plan_is_deterministic_multiphase_and_completion_driven():
+    image = _synthetic_portrait()
+    start = (0.82, 0.18)
+    first, first_meta = _residual_pigment_strokes(image, 1000.0, 4000.0, start)
+    second, second_meta = _residual_pigment_strokes(image, 1000.0, 4000.0, start)
+
+    assert first == second
+    assert first_meta == second_meta
+    assert first
+    assert first[0]["x0"] == pytest.approx(start[0], abs=1e-5)
+    assert first[0]["y0"] == pytest.approx(start[1], abs=1e-5)
+    phases = [stroke["phase"] for stroke in first]
+    assert list(dict.fromkeys(phases)) == ["mass", "form", "accent", "final-lock"]
+    assert all(stroke["color"].startswith("#") for stroke in first)
+    assert all(len(stroke["lab"]) == 3 for stroke in first)
+    assert all("importance" in stroke for stroke in first)
+    assert all("residualBefore" in stroke for stroke in first)
+    assert all("coverageAfter" in stroke for stroke in first)
+    final_locks = [stroke for stroke in first if stroke["phase"] == "final-lock"]
+    assert {stroke["role"] for stroke in final_locks} == {
+        "subject-contour",
+        "face-oval",
+        "face-feature-contour",
+    }
+    assert all(len(stroke["points"]) >= 2 for stroke in final_locks)
+    assert all(stroke["boundary"]["narrowLock"] for stroke in final_locks)
+    assert final_locks[-1]["startMs"] + final_locks[-1]["durationMs"] == pytest.approx(
+        5000.0, abs=0.02
+    )
+    assert first_meta["completion"]["passed"]
+    measured = first_meta["completion"]["measured"]
+    targets = first_meta["completion"]["targets"]
+    assert measured["overallCoverage"] >= targets["overallCoverage"]
+    assert measured["importantCoverage"] >= targets["importantCoverage"]
+    assert measured["largestHoleRatio"] <= targets["largestHoleRatioMax"]
+    assert measured["importantMeanDeltaE76"] <= targets["importantMeanDeltaE76Max"]
+    assert all(
+        region["coverage"] >= targets["regionCoverage"]
+        and region["meanDeltaE76"] <= targets["regionMeanDeltaE76Max"]
+        for region in measured["regions"]
+    )
+    assert first_meta["settleStrokes"]
+    assert first_meta["settleMetrics"]["strokeCount"] == len(
+        first_meta["settleStrokes"]
+    )
+    assert first_meta["settleMetrics"]["after"] == measured
+    assert all(
+        stroke["pass"] == "settle-correction"
+        and stroke["boundary"]["allowedDeltaE76"] <= 6.0
+        and "clippedPixelRatio" in stroke["boundary"]
+        for stroke in first_meta["settleStrokes"]
     )
     assert first[-1]["startMs"] + first[-1]["durationMs"] == pytest.approx(
         5000.0, abs=0.1
@@ -175,6 +230,59 @@ def test_generated_sampled_project_paints_colors_without_source_mask(
     assert "globalCompositeOperation = 'source-in'" not in html
     assert "targetCtx.strokeStyle = s.c" in html
     assert '"c":"#' in html
+
+
+def test_generated_residual_project_has_lock_settle_lift_and_delayed_camera_release(
+    tmp_path,
+):
+    source = tmp_path / "synthetic.png"
+    assert cv2.imwrite(str(source), _synthetic_portrait())
+    output = tmp_path / "residual"
+
+    plan = generate_sketch_project(
+        source,
+        output,
+        duration_ms=6000.0,
+        fps=20.0,
+        hold_ms=900.0,
+        photo_fade_ms=800.0,
+        max_strokes=120,
+        color_mode="residual-pigment",
+        closeup_mode="phase-focus",
+        closeup_zoom=1.6,
+    )
+    html = (output / "index.html").read_text(encoding="utf-8")
+    coloring = plan["coloring"]
+    phases = coloring["phaseTiming"]
+
+    assert coloring["resolvedMode"] == "residual-pigment"
+    assert coloring["textureMix"] == 0.0
+    assert coloring["completion"]["passed"]
+    assert phases["final-lock"]["endMs"] == pytest.approx(
+        plan["timing"]["pigmentEndMs"], abs=0.02
+    )
+    assert phases["settle"]["startMs"] == phases["final-lock"]["endMs"]
+    assert phases["cameraRelease"]["startMs"] >= phases["settle"]["endMs"]
+    assert phases["finalHold"]["startMs"] == phases["cameraRelease"]["endMs"]
+    before_release = [
+        frame
+        for frame in plan["cameraTable"]
+        if frame["t"] * 1000 <= phases["cameraRelease"]["startMs"]
+    ][-1]
+    assert before_release["s"] > 1.0
+    assert plan["cameraTable"][-1] == {
+        "t": 6.0,
+        "s": 1.0,
+        "cx": 0.5,
+        "cy": 0.5,
+    }
+    assert "globalCompositeOperation = 'source-in'" not in html
+    assert "drawImage(" not in html
+    assert 'id="photo"' not in html
+    assert "assets/source" not in html
+    assert "strokePath(targetCtx" in html
+    assert "SETTLE_START" in html
+    assert "TOOL_LIFT_START" in html
 
 
 def test_legacy_paint_alias_resolves_to_reveal(tmp_path):
