@@ -87,11 +87,11 @@ def test_residual_pigment_plan_is_deterministic_multiphase_and_completion_driven
     final_locks = [stroke for stroke in first if stroke["phase"] == "final-lock"]
     assert {stroke["role"] for stroke in final_locks} == {
         "subject-contour",
-        "face-oval",
         "face-feature-contour",
     }
     assert all(len(stroke["points"]) >= 2 for stroke in final_locks)
     assert all(stroke["boundary"]["narrowLock"] for stroke in final_locks)
+    assert "face-oval" not in {stroke["role"] for stroke in final_locks}
     assert final_locks[-1]["startMs"] + final_locks[-1]["durationMs"] == pytest.approx(
         5000.0, abs=0.02
     )
@@ -112,6 +112,8 @@ def test_residual_pigment_plan_is_deterministic_multiphase_and_completion_driven
         first_meta["settleStrokes"]
     )
     assert first_meta["settleMetrics"]["after"] == measured
+    assert first_meta["subjectMatte"]["foregroundRatio"] > 0.0
+    assert first_meta["subjectMatte"]["backgroundTreatment"].startswith("blurred")
     assert all(
         stroke["pass"] == "settle-correction"
         and stroke["boundary"]["allowedDeltaE76"] <= 6.0
@@ -258,6 +260,15 @@ def test_generated_residual_project_has_lock_settle_lift_and_delayed_camera_rele
     assert coloring["resolvedMode"] == "residual-pigment"
     assert coloring["textureMix"] == 0.0
     assert coloring["completion"]["passed"]
+    assert coloring["subjectMatte"]["backgroundTreatment"].startswith("blurred")
+    assert plan["vectorization"]["foregroundDetailFilter"]["keptStrokeCount"] == len(
+        plan["strokes"]
+    )
+    assert all(
+        stroke["inkOpacity"] == 0.44 and stroke["inkWidth"] == 1.35
+        for stroke in plan["strokes"]
+        if stroke["inkRole"] == "face-detail"
+    )
     assert phases["final-lock"]["endMs"] == pytest.approx(
         plan["timing"]["pigmentEndMs"], abs=0.02
     )

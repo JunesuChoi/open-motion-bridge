@@ -21,9 +21,12 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import mediapipe as mp
 import numpy as np
 
 from .pipeline import SCHEMA_VERSION, _sha256, _utc_now, _write_json
+
+_SELFIE_SEGMENTER: Any | None = None
 
 
 def _extract_strokes(
@@ -451,6 +454,121 @@ def _delta_e76_map(current_lab: np.ndarray, target_lab: np.ndarray) -> np.ndarra
     return np.linalg.norm(target_cie - current_cie, axis=2)
 
 
+def _subject_foreground_mask(image: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+    """Return a local semantic portrait matte with a deterministic fallback.
+
+    The drawing needs to distinguish a person from stage lettering and other
+    high-contrast background objects. This matte is a routing hint for ink and
+    pigment detail, never a claim that the result is pixel-perfect segmentation.
+    """
+    height, width = image.shape[:2]
+    yy, xx = np.ogrid[:height, :width]
+    fallback = ((xx - width * 0.5) / max(1.0, width * 0.47)) ** 2 + (
+        (yy - height * 0.52) / max(1.0, height * 0.60)
+    ) ** 2 <= 1.0
+    metadata: dict[str, Any] = {
+        "source": "central-portrait-prior",
+        "threshold": 0.35,
+        "foregroundRatio": round(float(fallback.mean()), 5),
+    }
+    try:
+        global _SELFIE_SEGMENTER
+        if _SELFIE_SEGMENTER is None:
+            _SELFIE_SEGMENTER = mp.solutions.selfie_segmentation.SelfieSegmentation(
+                model_selection=1
+            )
+        result = _SELFIE_SEGMENTER.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        confidence = result.segmentation_mask
+        semantic = confidence >= 0.35
+        ratio = float(semantic.mean())
+        if 0.08 <= ratio <= 0.88:
+            matte = cv2.morphologyEx(
+                semantic.astype(np.uint8),
+                cv2.MORPH_CLOSE,
+                np.ones((5, 5), np.uint8),
+                iterations=1,
+            ).astype(bool)
+            metadata = {
+                "source": "mediapipe-selfie-segmentation",
+                "threshold": 0.35,
+                "foregroundRatio": round(float(matte.mean()), 5),
+            }
+            return matte, metadata
+    except (AttributeError, RuntimeError, cv2.error):
+        pass
+    return fallback, metadata
+
+
+def _face_candidate_box(image: np.ndarray) -> tuple[int, int, int, int, str]:
+    """Find a local face box, retaining a conservative centre prior as fallback."""
+    height, width = image.shape[:2]
+    detected_faces: list[tuple[int, int, int, int]] = []
+    try:
+        cascade_path = str(
+            Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+        )
+        cascade = cv2.CascadeClassifier(cascade_path)
+        if not cascade.empty():
+            detected_faces = [
+                tuple(map(int, face))
+                for face in cascade.detectMultiScale(
+                    cv2.cvtColor(image, cv2.COLOR_BGR2GRAY),
+                    scaleFactor=1.1,
+                    minNeighbors=5,
+                    minSize=(24, 24),
+                )
+            ]
+    except (AttributeError, cv2.error):
+        detected_faces = []
+    if detected_faces:
+        fx, fy, fw, fh = max(
+            detected_faces,
+            key=lambda box: box[2]
+            * box[3]
+            * (1.2 - abs((box[0] + box[2] / 2) / width - 0.5)),
+        )
+        return fx, fy, fw, fh, "opencv-haar"
+    fw, fh = int(width * 0.34), int(height * 0.30)
+    fx, fy = int(width * 0.5 - fw / 2), int(height * 0.36 - fh / 2)
+    return fx, fy, fw, fh, "central-portrait-prior"
+
+
+def _face_candidate_mask(image: np.ndarray) -> tuple[np.ndarray, str]:
+    """Build an ellipse slightly inside the face box for delicate ink treatment."""
+    height, width = image.shape[:2]
+    fx, fy, fw, fh, source = _face_candidate_box(image)
+    yy, xx = np.ogrid[:height, :width]
+    mask = ((xx - (fx + fw / 2.0)) / max(1.0, fw * 0.52)) ** 2 + (
+        (yy - (fy + fh / 2.0)) / max(1.0, fh * 0.52)
+    ) ** 2 <= 1.0
+    return mask, source
+
+
+def _stroke_foreground_fraction(
+    points: list[tuple[float, float]], foreground: np.ndarray
+) -> float:
+    """Estimate how much of an extracted SVG contour belongs to the subject."""
+    height, width = foreground.shape
+    samples: list[tuple[int, int]] = []
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        segment = max(
+            1, int(math.ceil(math.hypot(x1 - x0, y1 - y0) * max(width, height)))
+        )
+        for step in range(segment + 1):
+            mix = step / segment
+            samples.append(
+                (
+                    min(width - 1, max(0, int(round((x0 + (x1 - x0) * mix) * width)))),
+                    min(
+                        height - 1, max(0, int(round((y0 + (y1 - y0) * mix) * height)))
+                    ),
+                )
+            )
+    if not samples:
+        return 0.0
+    return float(np.mean([foreground[y, x] for x, y in samples]))
+
+
 def _masked_completion(
     mask: np.ndarray, coverage: np.ndarray, delta: np.ndarray
 ) -> dict[str, float]:
@@ -477,18 +595,26 @@ def _coverage_metrics(
     current_lab: np.ndarray,
     target_lab: np.ndarray,
     importance: np.ndarray,
+    evaluation_mask: np.ndarray | None = None,
 ) -> dict[str, float]:
     """Measure completion from the simulated pigment field, not stroke count."""
     touched = coverage >= 0.5
-    important = importance >= 0.72
-    overall = float(touched.mean())
+    domain = (
+        evaluation_mask.astype(bool)
+        if evaluation_mask is not None
+        else np.ones_like(touched, dtype=bool)
+    )
+    important = np.logical_and(importance >= 0.72, domain)
+    overall = float(touched[domain].mean()) if np.any(domain) else 0.0
     important_coverage = (
         float(touched[important].mean()) if np.any(important) else overall
     )
-    holes = np.logical_not(touched).astype(np.uint8)
+    holes = np.logical_and(domain, np.logical_not(touched)).astype(np.uint8)
     _, _, stats, _ = cv2.connectedComponentsWithStats(holes, connectivity=8)
     largest_hole = (
-        float(stats[1:, cv2.CC_STAT_AREA].max()) / holes.size if len(stats) > 1 else 0.0
+        float(stats[1:, cv2.CC_STAT_AREA].max()) / int(domain.sum())
+        if len(stats) > 1 and np.any(domain)
+        else 0.0
     )
     delta = _delta_e76_map(current_lab, target_lab)
     important_delta = (
@@ -500,7 +626,9 @@ def _coverage_metrics(
         "importantCoverage": round(important_coverage, 5),
         "largestHoleRatio": round(largest_hole, 5),
         "importantMeanDeltaE76": round(important_delta, 3),
-        "meanResidual": round(float(residual.mean()), 5),
+        "meanResidual": round(float(residual[domain].mean()), 5)
+        if np.any(domain)
+        else 0.0,
     }
 
 
@@ -521,36 +649,7 @@ def _portrait_importance_map(
     regions: list[dict[str, Any]] = []
     region_masks: list[np.ndarray] = []
 
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    detected_faces: list[tuple[int, int, int, int]] = []
-    try:
-        cascade_path = str(
-            Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
-        )
-        cascade = cv2.CascadeClassifier(cascade_path)
-        if not cascade.empty():
-            detected_faces = [
-                tuple(map(int, face))
-                for face in cascade.detectMultiScale(
-                    gray, scaleFactor=1.1, minNeighbors=5, minSize=(24, 24)
-                )
-            ]
-    except (AttributeError, cv2.error):
-        detected_faces = []
-
-    if detected_faces:
-        face_box = max(
-            detected_faces,
-            key=lambda box: box[2]
-            * box[3]
-            * (1.2 - abs((box[0] + box[2] / 2) / width - 0.5)),
-        )
-        fx, fy, fw, fh = face_box
-        face_source = "opencv-haar"
-    else:
-        fw, fh = int(width * 0.34), int(height * 0.30)
-        fx, fy = int(width * 0.5 - fw / 2), int(height * 0.36 - fh / 2)
-        face_source = "central-portrait-prior"
+    fx, fy, fw, fh, face_source = _face_candidate_box(image)
 
     yy, xx = np.ogrid[:height, :width]
     face_cx, face_cy = fx + fw / 2.0, fy + fh / 2.0
@@ -626,15 +725,38 @@ def _residual_pigment_strokes(
     paint_ms: float,
     start_point: tuple[float, float],
     fps: float = 30.0,
+    foreground_mask: np.ndarray | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Precompute boundary-bounded pigment strokes and measurable completion."""
+    """Precompute subject-aware, boundary-bounded pigment strokes."""
     source_h, source_w = work.shape[:2]
     scale = min(1.0, 288.0 / max(source_w, source_h))
     sim_w = max(48, int(round(source_w * scale)))
     sim_h = max(48, int(round(source_h * scale)))
-    image = cv2.resize(work, (sim_w, sim_h), interpolation=cv2.INTER_AREA)
+    source_image = cv2.resize(work, (sim_w, sim_h), interpolation=cv2.INTER_AREA)
+    if foreground_mask is None:
+        full_foreground, foreground_metadata = _subject_foreground_mask(work)
+    else:
+        full_foreground = foreground_mask.astype(bool)
+        foreground_metadata = {
+            "source": "provided-subject-matte",
+            "threshold": None,
+            "foregroundRatio": round(float(full_foreground.mean()), 5),
+        }
+    foreground = (
+        cv2.resize(
+            full_foreground.astype(np.uint8),
+            (sim_w, sim_h),
+            interpolation=cv2.INTER_AREA,
+        )
+        >= 0.5
+    )
+    # Background is deliberately a broad color field. It keeps the scene's
+    # light and palette without tracing stage text as though it were anatomy.
+    blurred_background = cv2.GaussianBlur(source_image, (0, 0), 8.0)
+    image = np.where(foreground[..., None], source_image, blurred_background)
     image = cv2.GaussianBlur(image, (0, 0), 0.85)
     target_lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    source_gray = cv2.cvtColor(source_image, cv2.COLOR_BGR2GRAY)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
@@ -643,8 +765,26 @@ def _residual_pigment_strokes(
     jyy = cv2.GaussianBlur(grad_y * grad_y, (0, 0), 2.1)
     jxy = cv2.GaussianBlur(grad_x * grad_y, (0, 0), 2.1)
     tangent = 0.5 * np.arctan2(2.0 * jxy, jxx - jyy) + math.pi / 2.0
+    source_grad_x = cv2.Sobel(source_gray, cv2.CV_32F, 1, 0, ksize=3)
+    source_grad_y = cv2.Sobel(source_gray, cv2.CV_32F, 0, 1, ksize=3)
+    source_gradient = cv2.magnitude(source_grad_x, source_grad_y)
     importance, importance_regions, importance_masks = _portrait_importance_map(
-        image, gradient
+        source_image, source_gradient
+    )
+    importance = np.where(foreground, importance, np.minimum(importance, 0.16)).astype(
+        np.float32
+    )
+    skin_focus = np.zeros((sim_h, sim_w), dtype=bool)
+    for mask in importance_masks:
+        skin_focus |= mask
+    hair_focus = np.logical_and(
+        foreground,
+        np.logical_and(
+            np.logical_not(skin_focus),
+            gray <= np.percentile(gray[foreground], 34.0)
+            if np.any(foreground)
+            else False,
+        ),
     )
     strong_edge_threshold = max(8.0, float(np.percentile(gradient, 88.0)))
 
@@ -657,7 +797,9 @@ def _residual_pigment_strokes(
     settle_strokes: list[dict[str, Any]] = []
 
     def metrics() -> dict[str, float]:
-        return _coverage_metrics(coverage, current_lab, target_lab, importance)
+        return _coverage_metrics(
+            coverage, current_lab, target_lab, importance, foreground
+        )
 
     def region_metrics() -> list[dict[str, Any]]:
         delta = _delta_e76_map(current_lab, target_lab)
@@ -669,7 +811,10 @@ def _residual_pigment_strokes(
     def quick_values() -> tuple[float, float]:
         delta = _delta_e76_map(current_lab, target_lab)
         residual = 0.58 * (1.0 - coverage) + 0.42 * np.minimum(delta / 60.0, 1.0)
-        return float((coverage >= 0.5).mean()), float(residual.mean())
+        return (
+            float((coverage[foreground] >= 0.5).mean()),
+            float(residual[foreground].mean()),
+        )
 
     def residual_field(
         importance_weight: float, color_weight: float, sigma: float
@@ -679,6 +824,7 @@ def _residual_pigment_strokes(
             (1.0 - color_weight) * (1.0 - coverage)
             + color_weight * np.minimum(delta / 70.0, 1.0)
         ) * (0.7 + importance * importance_weight)
+        field *= np.where(foreground, 1.0, 0.22)
         return cv2.GaussianBlur(field, (0, 0), sigma)
 
     def cv_lab_distance(left: np.ndarray, right: np.ndarray) -> float:
@@ -782,6 +928,32 @@ def _residual_pigment_strokes(
         correction_reason: str | None = None,
     ) -> None:
         px, py = center
+        region = (
+            "skin"
+            if skin_focus[py, px]
+            else "hair"
+            if hair_focus[py, px]
+            else "garment-or-prop"
+            if foreground[py, px]
+            else "background"
+        )
+        if region == "skin":
+            radius *= {
+                "mass": 0.70,
+                "form": 0.80,
+                "accent": 0.90,
+                "settle-correction": 0.82,
+            }[phase]
+            base_length *= 0.78
+            opacity *= 0.88
+        elif region == "hair":
+            radius *= {
+                "mass": 0.84,
+                "form": 0.90,
+                "accent": 0.96,
+                "settle-correction": 0.90,
+            }[phase]
+            base_length *= 0.86
         patch_scale = {
             "mass": 0.35,
             "form": 0.24,
@@ -853,6 +1025,7 @@ def _residual_pigment_strokes(
                 "color": color,
                 "lab": [round(value, 2) for value in color_lab],
                 "importance": round(stroke_importance, 4),
+                "region": region,
                 "residualBefore": round(before_residual, 5),
                 "residualAfter": round(after_residual, 5),
                 "coverageBefore": round(before_coverage, 5),
@@ -924,7 +1097,12 @@ def _residual_pigment_strokes(
 
     edges = cv2.Canny(gray, 55, 145)
     contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-    eligible = [c for c in contours if cv2.arcLength(c, True) >= max_dim * 0.22]
+    eligible = [
+        contour
+        for contour in contours
+        if cv2.arcLength(contour, True) >= max_dim * 0.22
+        and float(foreground[contour[:, 0, 1], contour[:, 0, 0]].mean()) >= 0.72
+    ]
     if eligible:
 
         def contour_score(contour: np.ndarray) -> float:
@@ -937,32 +1115,26 @@ def _residual_pigment_strokes(
         simplified = cv2.approxPolyDP(outer_contour, epsilon, True)[:, 0, :]
         outer_points = [(float(x) / sim_w, float(y) / sim_h) for x, y in simplified]
     else:
-        outer_points = [
-            (
-                0.5 + math.cos(index / 24.0 * math.tau) * 0.17,
-                0.36 + math.sin(index / 24.0 * math.tau) * 0.16,
-            )
-            for index in range(25)
-        ]
+        outer_points = []
     face = importance_regions[0]["box"]
     fx, fy, fw, fh = face
-    face_points = [
-        (
-            fx + fw * 0.5 + math.cos(index / 32.0 * math.tau) * fw * 0.48,
-            fy + fh * 0.5 + math.sin(index / 32.0 * math.tau) * fh * 0.52,
-        )
-        for index in range(33)
-    ]
     face_feature_contours: list[np.ndarray] = []
     face_x0, face_y0 = int(fx * sim_w), int(fy * sim_h)
     face_x1, face_y1 = int((fx + fw) * sim_w), int((fy + fh) * sim_h)
     for contour in contours:
         pts = contour[:, 0, :]
         center_x, center_y = pts[:, 0].mean(), pts[:, 1].mean()
+        if not (face_x0 <= center_x <= face_x1 and face_y0 <= center_y <= face_y1):
+            continue
+        if not (
+            face_y0 + (face_y1 - face_y0) * 0.24
+            <= center_y
+            <= face_y0 + (face_y1 - face_y0) * 0.84
+        ):
+            continue
         if (
-            face_x0 <= center_x <= face_x1
-            and face_y0 <= center_y <= face_y1
-            and cv2.arcLength(contour, False) >= max_dim * 0.035
+            cv2.arcLength(contour, False) >= max_dim * 0.025
+            and float(foreground[pts[:, 1], pts[:, 0]].mean()) >= 0.9
         ):
             face_feature_contours.append(contour)
     if face_feature_contours:
@@ -972,20 +1144,16 @@ def _residual_pigment_strokes(
         feature = cv2.approxPolyDP(feature, 0.9, False)[:, 0, :]
         feature_points = [(float(x) / sim_w, float(y) / sim_h) for x, y in feature]
     else:
-        feature_points = [
-            (fx + fw * 0.22, fy + fh * 0.47),
-            (fx + fw * 0.5, fy + fh * 0.44),
-            (fx + fw * 0.78, fy + fh * 0.47),
-        ]
+        feature_points = []
 
-    def add_lock(role: str, points: list[tuple[float, float]], width_px: float) -> None:
+    def add_lock(
+        role: str, points: list[tuple[float, float]], width_px: float, opacity: float
+    ) -> None:
         if len(points) < 2:
             return
-        if points[0] != points[-1] and role != "face-feature-contour":
-            points = points + [points[0]]
         if len(points) > 80:
             step = max(1, len(points) // 72)
-            points = points[::step] + [points[0]]
+            points = points[::step]
         pixel_points = np.array(
             [
                 [
@@ -1015,7 +1183,7 @@ def _residual_pigment_strokes(
             max(1, int(round(width_px))),
             lineType=cv2.LINE_AA,
         )
-        lock_alpha = lock_mask.astype(np.float32) / 255.0 * 0.28
+        lock_alpha = lock_mask.astype(np.float32) / 255.0 * opacity
         coverage[:] = coverage + lock_alpha * (1.0 - coverage)
         current_lab[:] = (
             current_lab * (1.0 - lock_alpha[..., None])
@@ -1033,7 +1201,7 @@ def _residual_pigment_strokes(
                 "x1": round(points[-1][0], 5),
                 "y1": round(points[-1][1], 5),
                 "width": round(width_px / sim_w, 5),
-                "opacity": 0.58,
+                "opacity": opacity,
                 "sampledColor": lock_color,
                 "color": lock_color,
                 "lab": [round(value, 2) for value in _cielab_triplet(lock_lab_cv)],
@@ -1046,12 +1214,11 @@ def _residual_pigment_strokes(
             }
         )
 
-    add_lock("subject-contour", outer_points, 1.15)
-    add_lock("face-oval", face_points, 0.9)
-    add_lock("face-feature-contour", feature_points, 0.75)
+    add_lock("subject-contour", outer_points, 1.0, 0.30)
+    add_lock("face-feature-contour", feature_points, 0.55, 0.20)
 
     before_settle = {**metrics(), "regions": region_metrics()}
-    hole_map = (coverage < 0.5).astype(np.uint8)
+    hole_map = np.logical_and(foreground, coverage < 0.5).astype(np.uint8)
     labels, _, stats, centroids = cv2.connectedComponentsWithStats(hole_map, 8)
     hole_candidates = sorted(
         (
@@ -1089,7 +1256,7 @@ def _residual_pigment_strokes(
         ):
             break
         if current["largestHoleRatio"] > 0.0015:
-            holes_now = (coverage < 0.5).astype(np.uint8)
+            holes_now = np.logical_and(foreground, coverage < 0.5).astype(np.uint8)
             label_count, label_map, stats, _ = cv2.connectedComponentsWithStats(
                 holes_now, 8
             )
@@ -1193,7 +1360,7 @@ def _residual_pigment_strokes(
             and measured["importantMeanDeltaE76"] <= targets["importantMeanDeltaE76Max"]
             and region_pass
         ),
-        "selection": "largest remaining coverage/color residual, color/edge-bounded streamlines, region-gated local correction",
+        "selection": "subject-matte residual, color/edge-bounded streamlines, and region-gated local correction",
         "simulationSize": [sim_w, sim_h],
         "importanceRegions": importance_regions,
     }
@@ -1219,6 +1386,16 @@ def _residual_pigment_strokes(
         "completion": completion,
         "settleStrokes": settle_strokes,
         "settleMetrics": settle_metrics,
+        "subjectMatte": {
+            **foreground_metadata,
+            "simulationForegroundRatio": round(float(foreground.mean()), 5),
+            "backgroundTreatment": "blurred low-frequency color field; no contour lock",
+            "regionCounts": {
+                "skin": int(skin_focus.sum()),
+                "hair": int(hair_focus.sum()),
+                "foreground": int(foreground.sum()),
+            },
+        },
     }
 
 
@@ -1477,6 +1654,14 @@ def generate_sketch_project(
         epsilon_px=1.2,
     )
     work_h, work_w = work.shape[0], work.shape[1]
+    subject_foreground, subject_matte = _subject_foreground_mask(work)
+    subject_strokes = [
+        stroke
+        for stroke in strokes
+        if _stroke_foreground_fraction(stroke, subject_foreground) >= 0.68
+    ]
+    if subject_strokes:
+        strokes = subject_strokes
     ordered = _order_strokes(strokes, work_w, work_h)[:max_strokes]
     if not ordered:
         raise RuntimeError(
@@ -1493,6 +1678,18 @@ def generate_sketch_project(
     paint_ms = active_ms - draw_ms if has_color_phase else 0.0
     gap_ms = min(28.0, draw_ms * 0.15 / max(1, len(ordered)))
     scheduled = _schedule(ordered, 0.0, draw_ms, gap_ms, "stroke")
+    face_detail_mask, face_detail_source = _face_candidate_mask(work)
+    face_detail_count = 0
+    for stroke in scheduled:
+        face_fraction = _stroke_foreground_fraction(
+            [(float(x), float(y)) for x, y in stroke["points"]], face_detail_mask
+        )
+        is_face_detail = face_fraction >= 0.56
+        if is_face_detail:
+            face_detail_count += 1
+        stroke["inkRole"] = "face-detail" if is_face_detail else "subject-outline"
+        stroke["inkOpacity"] = 0.44 if is_face_detail else 0.84
+        stroke["inkWidth"] = 1.35 if is_face_detail else 2.05
     residual_metadata: dict[str, Any] = {}
     settle_strokes: list[dict[str, Any]] = []
     if resolved_color_mode == "reveal":
@@ -1503,7 +1700,12 @@ def generate_sketch_project(
     elif resolved_color_mode == "residual-pigment":
         final_ink_point = tuple(map(float, scheduled[-1]["points"][-1]))
         paint_strokes, residual_metadata = _residual_pigment_strokes(
-            work, draw_ms, paint_ms, final_ink_point, fps
+            work,
+            draw_ms,
+            paint_ms,
+            final_ink_point,
+            fps,
+            subject_foreground,
         )
         settle_strokes = residual_metadata.pop("settleStrokes")
     else:
@@ -1620,6 +1822,17 @@ def generate_sketch_project(
             "strokeCount": len(scheduled),
             "totalInkPx": round(sum(s["lengthPx"] for s in scheduled), 1),
             "ordering": "coarse-to-fine, nearest-neighbour pen travel",
+            "foregroundDetailFilter": {
+                **subject_matte,
+                "keptStrokeCount": len(ordered),
+                "foregroundFractionMin": 0.68,
+            },
+            "faceInkTreatment": {
+                "source": face_detail_source,
+                "faceDetailStrokeCount": face_detail_count,
+                "faceDetailOpacity": 0.44,
+                "faceDetailWidth": 1.35,
+            },
         },
         "coloring": {
             "mode": color_mode,
@@ -1661,6 +1874,7 @@ def generate_sketch_project(
             "phaseTiming": residual_metadata.get("phaseTiming", {}),
             "completion": residual_metadata.get("completion"),
             "settleMetrics": residual_metadata.get("settleMetrics"),
+            "subjectMatte": residual_metadata.get("subjectMatte", subject_matte),
         },
         "camera": {
             "mode": resolved_closeup_mode,
@@ -1757,7 +1971,13 @@ def _render_sketch_html(plan: dict[str, Any], staged_image_name: str) -> str:
         )
         path_elements.append(f'<path id="{stroke["id"]}" d="{d}" />')
         stroke_meta.append(
-            {"id": stroke["id"], "s": stroke["startMs"], "d": stroke["durationMs"]}
+            {
+                "id": stroke["id"],
+                "s": stroke["startMs"],
+                "d": stroke["durationMs"],
+                "a": stroke.get("inkOpacity", 0.92),
+                "w": stroke.get("inkWidth", 2.1),
+            }
         )
     paths_markup = "".join(path_elements)
     meta_json = json.dumps(stroke_meta, separators=(",", ":"))
@@ -2103,6 +2323,8 @@ def _render_sketch_html(plan: dict[str, Any], staged_image_name: str) -> str:
         for (const entry of nodes) {{
           const p = Math.max(0, Math.min(1, (t - entry.meta.s) / entry.meta.d));
           entry.node.style.strokeDashoffset = String(entry.len * (1 - p));
+          entry.node.style.opacity = String(entry.meta.a);
+          entry.node.style.strokeWidth = String(entry.meta.w);
         }}
         drawPaint(t);
         {visual_finish_js}
